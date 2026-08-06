@@ -206,6 +206,18 @@ public class json2dcp {
         return name.replace("\\", "__").replace("/", "_").replace("$subnet$", "/");
     }
 
+    static String[] DEBUG_NETS = null;
+    /** True when J2D_DEBUG_NET names this net (comma-separated list). */
+    public static boolean debug_net(String name) {
+        if (DEBUG_NETS == null) {
+            String e = System.getenv("J2D_DEBUG_NET");
+            DEBUG_NETS = (e == null || e.isEmpty()) ? new String[0] : e.split(",");
+        }
+        for (String d : DEBUG_NETS)
+            if (d.equals(name)) return true;
+        return false;
+    }
+
     public static String fixup_init(String orig, int bits) {
         // Vivado seems *very* fussy here
         String hex = orig.split("'h")[1];
@@ -252,12 +264,60 @@ public class json2dcp {
         }
     }
 
+    /** Set a Unisim parameter only if the netlist did not supply one. */
+    public static void default_param(NextpnrCell nc, String key, String value) {
+        if (!nc.params.containsKey(key))
+            nc.rwCell.addProperty(key, value);
+    }
+
+    /** Does this PIP actually carry the hop nextpnr described?
+     *
+     * Wire NAMES repeat in every INT tile, so a hop that spans tiles --
+     * "INT_R_X31Y83/SR1BEG_S0 -> INT_R_X31Y65/LV0" -- can be "found" in the
+     * destination tile as INT_R_X31Y65/SR1BEG_S0->LV0.  That is a real pip, so
+     * it imports without error, and the net looks connected if you compare
+     * names; but SR1 is a single-length wire, so SR1BEG_S0@Y65 is a DIFFERENT
+     * node from the SR1BEG_S0@Y83 our route drives.  Vivado then reports the
+     * whole downstream branch as an antenna.  Compare NODES, not names.
+     * Either orientation is accepted: bidirectional pips are imported reversed.
+     */
+    public static boolean pip_matches_nodes(PIP p, Tile srcTile, String srcWire,
+                                            Tile dstTile, String dstWire) {
+        try {
+            // EXCEPTION: the per-tile constant pseudo-sources.  nextpnr writes
+            // a canonical placeholder tile for them -- "INT_L_X0Y138/GND_WIRE
+            // -> INT_L_X30Y138/GFAN1" -- where the real constant node is the
+            // DESTINATION tile's GND_WIRE (every INT tile has its own, driven
+            // by that tile's TIEOFF).  Validating the source node here rejected
+            // 10 of the GND net's pips and left it unroutable, so for these
+            // wires only the destination node is meaningful.
+            boolean constSrc = "GND_WIRE".equals(srcWire) || "VCC_WIRE".equals(srcWire);
+            Node expS = (!constSrc && srcTile != null && srcTile.getWireIndex(srcWire) != null)
+                    ? new Wire(srcTile, srcWire).getNode() : null;
+            Node expD = (dstTile != null && dstTile.getWireIndex(dstWire) != null)
+                    ? new Wire(dstTile, dstWire).getNode() : null;
+            if (expS == null && expD == null) return true;
+            Node gs = p.getStartNode(), gd = p.getEndNode();
+            boolean fwd = (expS == null || expS.equals(gs)) && (expD == null || expD.equals(gd));
+            boolean bwd = (expS == null || expS.equals(gd)) && (expD == null || expD.equals(gs));
+            return fwd || bwd;
+        } catch (RuntimeException ex) {
+            return true;   // never let the check itself drop a pip
+        }
+    }
+
     public static void connect_log_and_phys(Net net, Cell cell, String logical_pin) {
         // Best-effort wrapper: the SVS all-LUT netlist exposes several const/
         // logical-pin edge cases RapidWright can't map.  Skip the unmappable
         // connection (counted) so the DCP builds for STA rather than aborting.
         try { connect_log_and_phys_impl(net, cell, logical_pin); }
-        catch (RuntimeException ex) { skipConst++; }
+        catch (RuntimeException ex) {
+            skipConst++;
+            if (net != null && debug_net(net.getName()))
+                System.out.println("[dbg] connect FAILED net=" + net.getName()
+                        + " cell=" + cell.getName() + " pin=" + logical_pin
+                        + " site=" + cell.getSiteName() + " : " + ex);
+        }
     }
     public static void connect_log_and_phys_impl(Net net, Cell cell, String logical_pin) {
         // Similar to RapidWright's net.connect; but handles some special cases correctly
@@ -637,6 +697,30 @@ public class json2dcp {
                     nc.rwCell.addProperty("RAM_ADDRESS_SPACE", "2'b11");
                 }
 
+                // Unisim parameter defaults that nextpnr's JSON does not carry.
+                // Absent from the netlist because they were never set in the
+                // source and yosys emits only what it was given -- but Vivado
+                // demands them for a BITSTREAM, not merely for analysis:
+                //   [DRC ADEF-499] Cell ... has no value for attribute
+                //   SS_MOD_PERIOD. For proper hardware operation, ...
+                // On ibex that was the ONLY thing left between a repaired
+                // checkpoint and a bitstream: 9 errors over 5 attributes.
+                // Filled in only when absent, so a real value always wins.
+                // RapidWright exposes no parameter-default table (only
+                // CellPinStaticDefaults, which is about pins), hence the list.
+                String oty = nc.attrs.getOrDefault("X_ORIG_TYPE", nc.type);
+                if (oty != null) {
+                    if (oty.equals("MMCME2_ADV") || oty.equals("PLLE2_ADV")) {
+                        default_param(nc, "SS_MOD_PERIOD", "10000");
+                    } else if (oty.startsWith("RAMB18")) {
+                        for (String p : new String[]{"INIT_A", "INIT_B", "SRVAL_A", "SRVAL_B"})
+                            default_param(nc, p, "18'h00000");
+                    } else if (oty.startsWith("RAMB36")) {
+                        for (String p : new String[]{"INIT_A", "INIT_B", "SRVAL_A", "SRVAL_B"})
+                            default_param(nc, p, "36'h000000000");
+                    }
+                }
+
                 if (nc.type.startsWith("IOB_"))
                     nc.rwCell.setSiteFixed(true);
             }
@@ -702,6 +786,19 @@ public class json2dcp {
                             resolve_edif_pin(nn.driver.cell.rwCell, nn.driver.name));
                 }
             }
+            if (debug_net(nn.name)) {
+                System.out.println("[dbg] net " + nn.name
+                    + "  driver=" + (nn.driver == null ? "NONE"
+                        : nn.driver.cell.name + "." + nn.driver.name
+                          + " rwCell=" + (nn.driver.cell.rwCell == null ? "NULL" : "ok")
+                          + " xorig=" + nn.driver.cell.attrs.containsKey("X_ORIG_PORT_" + nn.driver.name))
+                    + "  users=" + nn.users.size());
+                for (NextpnrCellPort u : nn.users)
+                    System.out.println("[dbg]    user " + u.cell.name + "." + u.name
+                        + " type=" + u.cell.type
+                        + " rwCell=" + (u.cell.rwCell == null ? "NULL" : u.cell.rwCell.getSiteName())
+                        + " xorig=" + u.cell.attrs.get("X_ORIG_PORT_" + u.name));
+            }
             for (NextpnrCellPort usr : nn.users) {
                 if (usr.cell.rwCell != null) {
                     if (usr.cell.attrs.containsKey("X_ORIG_PORT_" + usr.name)) {
@@ -760,7 +857,8 @@ public class json2dcp {
             String[] routing = nn.attrs.get("ROUTING").split(";");
             int pipImported = 0, pipDroppedSiteWire = 0, pipDroppedSitePip = 0,
                 pipDroppedLookup = 0, pipDroppedParse = 0,
-                pipNodeTraversal = 0, pipOracleHit = 0, pipOracleReverseBidir = 0;
+                pipNodeTraversal = 0, pipOracleHit = 0, pipOracleReverseBidir = 0,
+                pipOracleNodeReject = 0;
             for (int i = 0; i < (routing.length-2); i+=3) {
                 String wire = routing[i];
                 String pip = routing[i+1];
@@ -971,6 +1069,15 @@ public class json2dcp {
                         }
                         PIP p = (dt != null && srcIdx != null && dstIdx != null)
                                 ? dt.getPIP(srcIdx, dstIdx) : null;
+                        // This legacy path looks BOTH wire names up in the
+                        // destination tile.  Wire names repeat in every INT
+                        // tile, so for a hop that spans tiles it can return a
+                        // real pip that is not the one nextpnr meant -- see
+                        // pip_matches_nodes() for the case that cost a day.
+                        if (p != null && !pip_matches_nodes(p, srcTile, srcS[1], dstTile, dstS[1])) {
+                            pipOracleNodeReject++;
+                            p = null;
+                        }
                         if (p != null) {
                             n.addPIP(p);
                             pipImported++;
@@ -1012,6 +1119,25 @@ public class json2dcp {
                                     }
                                 }
                                 if (got != null) break;
+                            }
+                            // VALIDATE the name-based match against NODE identity.
+                            // The oracle is keyed by wire NAME, and names like
+                            // SR1BEG_S0 exist in every INT tile, so a hop that
+                            // spans tiles can match a real-but-WRONG pip in the
+                            // destination tile.  That is exactly what killed
+                            // johnson's led_int[4]: the hop
+                            //   INT_R_X31Y83/SR1BEG_S0 -> INT_R_X31Y65/LV0
+                            // matched INT_R_X31Y65/SR1BEG_S0->LV0, a valid pip
+                            // whose start node (SR1BEG_S0@Y65) our route never
+                            // drives -- SR1 is a single-length wire, so Y83 and
+                            // Y65 are different nodes.  The pip imported without
+                            // error, the net looked connected by name, and
+                            // Vivado reported an antenna.  Long lines are where
+                            // this shows because they are the hops whose source
+                            // and destination tiles differ.
+                            if (got != null && !pip_matches_nodes(got, srcTile, srcS[1], dstTile, dstS[1])) {
+                                pipOracleNodeReject++;
+                                got = null;          // fall through to the node search
                             }
                             if (got != null) {
                                 n.addPIP(got);
@@ -1075,7 +1201,7 @@ public class json2dcp {
                             }
                         }
                         pipDroppedLookup++;
-                        if (nn.name.equals("clk") && pipDroppedLookup < 8) {
+                        if (debug_net(nn.name) && pipDroppedLookup < 8) {
                             String srcType = (srcTile != null)
                                     ? srcTile.getTileTypeEnum().toString() : "?";
                             String dstType = (dstTile != null)
@@ -1102,8 +1228,11 @@ public class json2dcp {
             }
             // Per-net routing-import summary on a few key nets so we know
             // where the gaps are without overwhelming the build output.
-            if (nn.name.equals("clk") || nn.name.equals("clk_raw")
-                || nn.name.equals("q") || nn.name.equals("rst_IBUF")) {
+            // J2D_DEBUG_NET=<name>[,<name>...] traces exactly where one net's
+            // routing goes, which is the only way to tell "the importer dropped
+            // it" from "nextpnr never routed it".  Replaces a hardcoded list of
+            // net names from some long-gone debug session.
+            if (debug_net(nn.name)) {
                 System.out.println("json2dcp ROUTING net=" + nn.name
                     + ": imported=" + pipImported
                     + " (oracle=" + pipOracleHit
@@ -1112,7 +1241,8 @@ public class json2dcp {
                     + " sitewire_skipped=" + pipDroppedSiteWire
                     + " sitepip_skipped=" + pipDroppedSitePip
                     + " lookup_failed=" + pipDroppedLookup
-                    + " parse_failed=" + pipDroppedParse);
+                    + " parse_failed=" + pipDroppedParse
+                    + " oracle_node_reject=" + pipOracleNodeReject);
             }
 
             for (int i = 0; i < (routing.length-2); i+=3) {
@@ -1278,6 +1408,60 @@ public class json2dcp {
                 // Process top level IO
                 EDIFPortInst epi = EDIFTools.createTopLevelPortInst(des, nc.name, PinType.valueOf(nc.attrs.get("X_IO_DIR")));
                 Net pad_net = nc.ports.get("PAD").net.rwNet;
+
+                // --- physical <PORT> cell on the PAD BEL -------------------
+                // Vivado's own DCP places a <PORT> cell on the PAD BEL of every
+                // IOB it uses (11 of them in the golden johnson); ours placed
+                // none, so nothing anchored the port to its site.  nextpnr
+                // gives us the site in NEXTPNR_BEL ("IOB_X0Y49/IOB18/PAD").
+                Site padSite = null;
+                String nbel = nc.attrs.get("NEXTPNR_BEL");
+                if (nbel != null && nbel.indexOf('/') > 0)
+                    padSite = des.getDevice().getSite(nbel.substring(0, nbel.indexOf('/')));
+                SiteInst padSi = null;
+                if (padSite != null) {
+                    padSi = des.getSiteInstFromSite(padSite);
+                    if (padSi == null)
+                        padSi = des.createSiteInst(padSite);
+                    BEL padBel = padSi.getBEL("PAD");
+                    if (padBel != null && padSi.getCell(padBel) == null) {
+                        Cell pcell = new Cell(nc.name, padSi, padBel);
+                        pcell.setType("<PORT>");
+                        padSi.addCell(pcell);
+                    }
+                }
+
+                // --- differential input: the N half ------------------------
+                // The golden routes it as ONE pip, slave PADOUT -> master
+                // DIFFI_IN, and reserves the slave's input buffer with a
+                // <LOCKED> cell.  We emitted no physical net at all, so Vivado
+                // called sysclk_n unrouted and refused bitgen.  Detect the N
+                // pad by its net feeding somebody's DIFFI_IN.
+                NextpnrCellPort diffUser = null;
+                if (nc.ports.get("PAD").net != null)
+                    for (NextpnrCellPort u : nc.ports.get("PAD").net.users)
+                        if (u.name.equals("DIFFI_IN") && u.cell.rwCell != null)
+                            diffUser = u;
+                if (diffUser != null && padSi != null) {
+                    SiteInst master = diffUser.cell.rwCell.getSiteInst();
+                    BEL inbuf = padSi.getBEL("INBUF_DCIEN");
+                    if (inbuf != null && padSi.getCell(inbuf) == null) {
+                        Cell lk = new Cell("<LOCKED>", padSi, inbuf);
+                        lk.setType("<LOCKED>");
+                        padSi.addCell(lk);
+                    }
+                    try {
+                        SitePinInst sp = pad_net.createPin("PADOUT", padSi);
+                        SitePinInst sk = pad_net.createPin("DIFFI_IN", master);
+                        Node a = sp.getConnectedNode(), b = sk.getConnectedNode();
+                        if (a != null && b != null)
+                            for (PIP pp : a.getAllDownhillPIPs())
+                                if (b.equals(pp.getEndNode())) { pad_net.addPIP(pp); break; }
+                    } catch (RuntimeException ex) {
+                        System.out.println("WARNING: diff-pair N stitch failed for "
+                                + nc.name + ": " + ex);
+                    }
+                }
                 pad_net.getLogicalNet().addPortInst(epi);
                 for (var attr : nc.attrs.entrySet()) {
                     pad_net.getLogicalNet().addProperty(attr.getKey(), attr.getValue());
@@ -1641,6 +1825,50 @@ public class json2dcp {
         }
 
         // ------------------------------------------------------------------
+        // Anchor the constant nets to their TIEOFFs.
+        //
+        // nextpnr sources GND/VCC from the per-INT-tile pseudo-constant wires
+        // ("INT_L_X0Y138/GND_WIRE -> INT_L_X30Y138/GFAN1"), so we import PIPs
+        // for them but never create a SOURCE site pin -- Vivado then reports
+        // GLOBAL_LOGIC0/1 as partial antennas (routing with nothing driving it)
+        // and refuses bitgen.  Vivado's own DCP of the same design drives VCC
+        // from TIEOFF/HARD1, and every INT tile has a co-located TIEOFF whose
+        // HARD0/HARD1 pin IS that GND_WIRE/VCC_WIRE node.  So the fix keeps
+        // nextpnr's routing verbatim -- non-optimal though it is, it is what
+        // the bitstream actually does -- and just adds the anchor Vivado needs.
+        // ------------------------------------------------------------------
+        {
+            int tieAdded = 0;
+            for (Net net : des.getNets()) {
+                if (!net.isStaticNet()) continue;
+                boolean isGnd = net.getName().contains("LOGIC0") || net.getName().contains("GND");
+                String pinName = isGnd ? "HARD0" : "HARD1";
+                String wantWire = isGnd ? "GND_WIRE" : "VCC_WIRE";
+                HashSet<String> done = new HashSet<>();
+                for (PIP p : new ArrayList<>(net.getPIPs())) {
+                    Node sn = p.getStartNode();
+                    if (sn == null) continue;
+                    if (!wantWire.equals(sn.getWireName())) continue;
+                    Tile t = sn.getTile();
+                    if (t == null) continue;
+                    for (Site site : t.getSites()) {
+                        if (site.getSiteTypeEnum() != SiteTypeEnum.TIEOFF) continue;
+                        if (!done.add(site.getName())) continue;
+                        SiteInst si = des.getSiteInstFromSite(site);
+                        if (si == null) si = des.createSiteInst(site);
+                        if (si.getSitePinInst(pinName) == null) {
+                            try { net.createPin(pinName, si); tieAdded++; }
+                            catch (RuntimeException ex) { /* already attached */ }
+                        }
+                    }
+                }
+            }
+            if (tieAdded > 0)
+                System.out.println("[tieoff] anchored " + tieAdded
+                        + " constant-net source pin(s) to TIEOFF sites");
+        }
+
+        // ------------------------------------------------------------------
         // Pre-write routing sanity (#island).  RapidWright's (closed,
         // obfuscated) DCP writer walks each net's PIPs from the graph
         // roots (start nodes that are never any PIP's end node); any PIP
@@ -1692,9 +1920,21 @@ public class json2dcp {
                     Node n0 = spi.getConnectedNode();
                     if (n0 != null && reached.add(n0)) queue.add(n0);
                 }
-                if (reached.isEmpty())
-                    for (Node s : starts)
-                        if (!ends.contains(s)) { reached.add(s); queue.add(s); }
+                // Seed from the GRAPH ROOTS as well, not just as a fallback.
+                // The writer's own walk starts at roots (per the comment above),
+                // so seeding only from the source site pin made this replica
+                // STRICTER than the thing it replicates, and it threw away the
+                // routing of perfectly good nets.  On the johnson counter it
+                // killed led_int[4] -- 8 of 25 pips "unreachable" -- where the
+                // unreached chain hung off long lines (LV0/LVB12/LVB0 at
+                // different tiles) and the SING-tile IOI's OLOGIC route-through,
+                // whose nodes do not chain from the source in RapidWright's
+                // model.  Dropping a net's routing is the worst possible
+                // outcome for a check-only signoff: Vivado then reports it as
+                // unrouted and refuses bitgen, blaming our router for the
+                // importer's mistake.
+                for (Node s : starts)
+                    if (!ends.contains(s) && reached.add(s)) queue.add(s);
                 while (!queue.isEmpty()) {
                     Node n = queue.poll();
                     ArrayList<Node> cs = adj.get(n);
@@ -1823,6 +2063,14 @@ public class json2dcp {
             }
         }
 
+        for (Net dn : des.getNets()) {
+            if (!debug_net(dn.getName())) continue;
+            System.out.println("[dbg] FINAL net " + dn.getName()
+                + " pips=" + dn.getPIPs().size()
+                + " pins=" + dn.getPins().size()
+                + " src=" + (dn.getSource() == null ? "NULL" : dn.getSource().toString())
+                + " logical=" + (dn.getLogicalNet() == null ? "NULL" : "ok"));
+        }
         des.writeCheckpoint(args[2]);
     }
 
