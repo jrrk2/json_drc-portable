@@ -195,10 +195,12 @@ public class json2dcp {
                     if (ins.size() > 1) shared = true;
                 }
             }
-            if (!shared) continue;
+            // NB: do NOT bail out on !shared here -- a constant-tied input is
+            // the other way a LUT arrives with fewer pins than its INIT width,
+            // and it is detected below.  The decision to skip is at the
+            // "nmiss == 0 && !shared" test, once both causes are known.
 
-            // old logical index -> physical pin; every input 0..k-1 must appear,
-            // otherwise this LUT has a genuinely unused input and is left alone.
+            // old logical index -> physical pin
             String[] where = new String[k];
             boolean ok = true;
             for (Map.Entry<String, java.util.List<Integer>> e : phys.entrySet())
@@ -207,13 +209,50 @@ public class json2dcp {
                     where[i] = e.getKey();
                 }
             if (!ok) continue;
-            for (int i = 0; i < k; i++) if (where[i] == null) { ok = false; break; }
-            if (!ok) continue;
 
-            // physical pin -> lowest old index on it; those survive, in order
+            // CONSTANT-TIED INPUTS.  A logical input with no X_ORIG_PORT is one
+            // yosys tied to a constant ("I5": ["0"]); nextpnr keeps the physical
+            // pin on $PACKER_GND_NET/$PACKER_VCC_NET but drops the logical
+            // mapping, so the cell arrives as 5 used pins with a 64-bit INIT --
+            // the same 20-756 Vivado rejects, for a different reason.  The fix
+            // is to COFACTOR: with I5 tied low, the 5-input function is the
+            // INIT's low half (ffffffffbf000000 -> 32'hbf000000).
+            int[] constVal = new int[k];
+            java.util.Arrays.fill(constVal, -1);
+            int nmiss = 0;
+            for (int i = 0; i < k; i++) if (where[i] == null) nmiss++;
+            if (nmiss > 0) {
+                // physical input pins carrying a constant and mapped to no logical pin
+                java.util.List<Integer> consts = new java.util.ArrayList<>();
+                for (NextpnrCellPort p : nc.ports.values()) {
+                    if (p.net == null || p.name.startsWith("O")) continue;
+                    if (nc.attrs.containsKey("X_ORIG_PORT_" + p.name)) continue;
+                    if (p.net.name.contains("PACKER_GND")) consts.add(0);
+                    else if (p.net.name.contains("PACKER_VCC")) consts.add(1);
+                }
+                // Only act when the tie is unambiguous: as many constant pins as
+                // missing inputs, all the same value.  Anything else is reported
+                // rather than guessed -- a wrong cofactor is a silent miscompile.
+                boolean uniform = consts.size() == nmiss && !consts.isEmpty();
+                if (uniform)
+                    for (int cv : consts) if (cv != consts.get(0)) uniform = false;
+                if (!uniform) {
+                    if (dbg)
+                        System.out.println("[shared-lut] SKIP " + nc.name + ": " + oty + " has "
+                                + nmiss + " unmapped logical input(s) but " + consts.size()
+                                + " constant pin(s) -- not reducing");
+                    continue;
+                }
+                for (int i = 0; i < k; i++) if (where[i] == null) constVal[i] = consts.get(0);
+            }
+            if (nmiss == 0 && !shared) continue;
+
+            // physical pin -> lowest old index on it; those survive, in order.
+            // constant-tied inputs have no physical pin and simply vanish.
             java.util.TreeMap<String, Integer> rep = new java.util.TreeMap<>();
             for (int i = 0; i < k; i++)
-                if (!rep.containsKey(where[i])) rep.put(where[i], i);
+                if (where[i] != null && !rep.containsKey(where[i])) rep.put(where[i], i);
+            if (rep.isEmpty()) continue;
             java.util.List<Integer> kept = new java.util.ArrayList<>(rep.values());
             java.util.Collections.sort(kept);
             java.util.HashMap<Integer, Integer> slot = new java.util.HashMap<>();
@@ -225,8 +264,11 @@ public class json2dcp {
             StringBuilder out = new StringBuilder();
             for (int v = 0; v < (1 << nm); v++) {
                 int o = 0;
-                for (int i = 0; i < k; i++)
-                    if (((v >> slot.get(rep.get(where[i]))) & 1) != 0) o |= 1 << i;
+                for (int i = 0; i < k; i++) {
+                    int b = (where[i] == null) ? constVal[i]
+                                               : ((v >> slot.get(rep.get(where[i]))) & 1);
+                    if (b != 0) o |= 1 << i;
+                }
                 out.append(init.charAt(init.length() - 1 - o));
             }
             // back out in the same sized-hex form parseParam produced
