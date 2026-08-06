@@ -855,10 +855,17 @@ public class json2dcp {
             }
 
             String[] routing = nn.attrs.get("ROUTING").split(";");
+            // A net must never contain the same PIP twice.  nextpnr emits the
+            // carry cascade as four hops -- CARRY4_CO3 -> COUT -> tile COUT ->
+            // tile CIN -> CIN -- two of which resolve to the SAME physical pip
+            // (CLBLM_M_COUT -> CLBLM_M_COUT_N), so we added it twice.  Vivado
+            // calls that a "partial route conflict" and refuses bitgen: 104 on
+            // picosoc, 71 on ibex, every one of them a CARRY4 CO[3].
+            HashSet<PIP> seenPips = new HashSet<>();
             int pipImported = 0, pipDroppedSiteWire = 0, pipDroppedSitePip = 0,
                 pipDroppedLookup = 0, pipDroppedParse = 0,
                 pipNodeTraversal = 0, pipOracleHit = 0, pipOracleReverseBidir = 0,
-                pipOracleNodeReject = 0;
+                pipOracleNodeReject = 0, pipDroppedDup = 0;
             for (int i = 0; i < (routing.length-2); i+=3) {
                 String wire = routing[i];
                 String pip = routing[i+1];
@@ -944,6 +951,32 @@ public class json2dcp {
                                 }
                             }
                         }
+                        // Intra-site SITEWIRE->SITEWIRE is the slice output
+                        // path.  The OUTMUX/USED SitePIPs it implies are ALREADY
+                        // bound elsewhere in this importer (verified: binding
+                        // them here changed the DCP's sitepip count not at all,
+                        // 6929 before and after), so nothing is missing.
+                        //
+                        // The 5 nets Vivado still rejects on picosoc are not an
+                        // import defect: nextpnr routes a LUT6's O6 out through
+                        // the slice's xMUX
+                        //   SITEWIRE/SLICE_X0Y66/D6LUT_O6 -> .../DMUX
+                        // and Vivado will not have it -- route_design -preserve
+                        // moves the source to the DIRECT pin (DMUX -> D) and
+                        // reroutes.  Its own exemplar (build/exemplar) shows the
+                        // convention: xOUTMUX carries O5, xUSED carries O6.
+                        // Fixing this belongs in nextpnr's router, not here.
+                        // NOTE: other intra-site SITEWIRE->SITEWIRE shapes -- "SITEWIRE/SLICE_X0Y66/
+                        // D6LUT_O6 -> .../DMUX" means DOUTMUX selects O6 -- and
+                        // leaving it unbound is why a net that leaves its slice
+                        // via xMUX shows up as a partial route / antenna
+                        // (4 nets on picosoc).  Binding the SitePIP whose input
+                        // and output sitewires match was TRIED and makes Vivado
+                        // SEGFAULT on open_checkpoint: matching on sitewire
+                        // names alone picks a mux on the wrong BEL, or one that
+                        // conflicts with a cell already placed there.  It needs
+                        // the BEL identified from the driving cell, not a name
+                        // search.  Counted, not bound, until then.
                         // SITEWIRE/site/pin -> tile-wire  (output, e.g. IOB.O)
                         if (leftIsSite && !rightIsSite) {
                             String[] parts = left.split("/", 3);
@@ -1079,8 +1112,8 @@ public class json2dcp {
                             p = null;
                         }
                         if (p != null) {
-                            n.addPIP(p);
-                            pipImported++;
+                            if (seenPips.add(p)) { n.addPIP(p); pipImported++; }
+                            else pipDroppedDup++;
                             continue;
                         }
                         // Oracle short-circuit: ask the static catalogue for
@@ -1140,8 +1173,8 @@ public class json2dcp {
                                 got = null;          // fall through to the node search
                             }
                             if (got != null) {
-                                n.addPIP(got);
-                                pipImported++;
+                                if (seenPips.add(got)) { n.addPIP(got); pipImported++; }
+                                else pipDroppedDup++;
                                 pipOracleHit++;
                                 if (isRev) pipOracleReverseBidir++;
                                 continue;
@@ -1192,8 +1225,8 @@ public class json2dcp {
                                     }
                                 }
                                 if (bridge != null) {
-                                    n.addPIP(bridge);
-                                    pipImported++;
+                                    if (seenPips.add(bridge)) { n.addPIP(bridge); pipImported++; }
+                                    else pipDroppedDup++;
                                     pipOracleHit++;
                                     if (bridgeReversed) pipOracleReverseBidir++;
                                     continue;
@@ -1218,8 +1251,9 @@ public class json2dcp {
                         int src = Integer.parseInt(wires[0]);
                         int dst = Integer.parseInt(wires[1]);
                         if (src < t.getWireCount() && dst < t.getWireCount()) {
-                            n.addPIP(t.getPIP(src, dst));
-                            pipImported++;
+                            PIP idxPip = t.getPIP(src, dst);
+                            if (seenPips.add(idxPip)) { n.addPIP(idxPip); pipImported++; }
+                            else pipDroppedDup++;
                         } else pipDroppedLookup++;
                     }
                 } catch (NumberFormatException | ArrayIndexOutOfBoundsException ex) {
@@ -1242,7 +1276,8 @@ public class json2dcp {
                     + " sitepip_skipped=" + pipDroppedSitePip
                     + " lookup_failed=" + pipDroppedLookup
                     + " parse_failed=" + pipDroppedParse
-                    + " oracle_node_reject=" + pipOracleNodeReject);
+                    + " oracle_node_reject=" + pipOracleNodeReject
+                    + " dup_skipped=" + pipDroppedDup);
             }
 
             for (int i = 0; i < (routing.length-2); i+=3) {
@@ -1650,7 +1685,15 @@ public class json2dcp {
                     try { rw.createPin("CIN", upperSi); }
                     catch (RuntimeException ex) { chainsFailed++; continue; }
                 }
-                rw.addPIP(carryPip);
+                // Only if the routing loop did not already import it.  nextpnr
+                // DOES emit the cascade hop (CLBLM_M_COUT -> CLBLM_M_CIN), so
+                // injecting unconditionally put the same pip on the net twice --
+                // which Vivado calls a "partial route conflict" and refuses to
+                // bitgen: 104 such nets on picosoc, 71 on ibex, every one a
+                // CARRY4 CO[3].  This pass predates the routing loop learning
+                // to import the hop.
+                if (!rw.getPIPs().contains(carryPip))
+                    rw.addPIP(carryPip);
                 // Select the CIN cascade on the follower's PRECYINIT mux.
                 // nextpnr leaves it implicit; without this the mux defaults to
                 // AX, an invalid carry config for a cell-driven CI (DRC
