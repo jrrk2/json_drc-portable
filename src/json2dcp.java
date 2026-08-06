@@ -2104,6 +2104,63 @@ public class json2dcp {
         // inputs) -- [DRC NDRV-1].  They have no driver by construction, so any
         // value is as good; GND is what Vivado's own opt_design ties them to.
         // ------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // GT REFERENCE CLOCK.  nextpnr DELIBERATELY disconnects GTREFCLK0/1 in
+        // pack_gt_xc7.cc: on 7-series GTREFCLK0 is HARDWIRED to the lower
+        // IBUFDS_GTE2 of the quad and GTREFCLK1 to the upper one, so there is
+        // nothing to route -- it records the choice as _GTREFCLK0_USED /
+        // _GTREFCLK1_USED and the FASM backend sets the config bit.  Correct for
+        // the open flow, and NOT a defect.
+        //
+        // Vivado's netlist DRC does not know that, and rejects the checkpoint:
+        //   [DRC REQP-51] must_use_ref_clock: an input reference clock pin
+        //   (GTREFCLK0, ...) or GTXE2_COMMON clock input (QPLLCLK) must be used
+        // along with PDCN-730/735 on the COMMON.  So put the LOGICAL connection
+        // back from the flag nextpnr left behind: no site pin, no routing, just
+        // the netlist edge Vivado's rule is looking for.
+        // ------------------------------------------------------------------
+        {
+            // the IBUFDS_GTE2 output net, by buffer position (_REL_BUF_Y)
+            java.util.HashMap<Integer, NextpnrNet> refbuf = new java.util.HashMap<>();
+            for (NextpnrCell nc : ndes.cells.values()) {
+                String oty = nc.attrs.getOrDefault("X_ORIG_TYPE", nc.type);
+                if (oty == null || !oty.startsWith("IBUFDS_GTE2")) continue;
+                NextpnrCellPort o = nc.ports.get("O");
+                if (o == null || o.net == null) continue;
+                int relY = 0;
+                String r = nc.attrs.get("_REL_BUF_Y");
+                if (r != null) try {
+                    r = r.trim();
+                    relY = r.length() > 1 ? Integer.parseInt(r, 2) : Integer.parseInt(r);
+                } catch (NumberFormatException e) { relY = 0; }
+                refbuf.put(relY, o.net);
+            }
+            int tiedRef = 0;
+            for (NextpnrCell nc : ndes.cells.values()) {
+                if (nc.rwCell == null) continue;
+                String oty = nc.attrs.getOrDefault("X_ORIG_TYPE", nc.type);
+                if (oty == null || !oty.startsWith("GTXE2")) continue;
+                EDIFCellInst inst = nc.rwCell.getEDIFCellInst();
+                if (inst == null) continue;
+                for (int idx = 0; idx <= 1; idx++) {
+                    String flag = nc.params.get("_GTREFCLK" + idx + "_USED");
+                    if (flag == null || flag.replace("'", "").endsWith("0")) continue;
+                    NextpnrNet rn = refbuf.get(idx);
+                    if (rn == null) rn = refbuf.get(0);          // single-buffer designs
+                    if (rn == null || rn.rwNet == null || rn.rwNet.getLogicalNet() == null) continue;
+                    String pin = "GTREFCLK" + idx;
+                    if (inst.getPortInst(pin) != null) continue;
+                    try {
+                        rn.rwNet.getLogicalNet().createPortInst(pin, inst);
+                        tiedRef++;
+                    } catch (RuntimeException ex) { /* no such port on this flavour */ }
+                }
+            }
+            if (tiedRef > 0)
+                System.out.println("[gt-refclk] reconnected " + tiedRef
+                        + " GTREFCLK pin(s) that nextpnr left implicit");
+        }
+
         {
             int tiedSel = 0;
             for (NextpnrCell nc : ndes.cells.values()) {
