@@ -395,6 +395,10 @@ public class json2dcp {
         return name.replace("\\", "__").replace("/", "_").replace("$subnet$", "/");
     }
 
+    /** cells whose RapidWright default pin map was kept (hard blocks: no X_ORIG_PORT). */
+    static int keptDefaultPinmap = 0, keptDefaultPins = 0, keptDroppedPins = 0;
+    static int hardSinkLogical = 0, hardSinkFailed = 0, hardSinkNoPort = 0;
+
     static String[] DEBUG_NETS = null;
     /** True when J2D_DEBUG_NET names this net (comma-separated list). */
     public static boolean debug_net(String name) {
@@ -438,15 +442,33 @@ public class json2dcp {
             EDIFCell type = inst.getCellType();
             if (type == null || type.getPort(name) != null)
                 return name;                       // genuine scalar, e.g. GTREFCLK0
-            int i = name.length();
-            while (i > 0 && Character.isDigit(name.charAt(i - 1)))
-                i--;
-            if (i == name.length() || i == 0)
-                return name;                       // no trailing index to split
-            String base = name.substring(0, i);
-            EDIFPort p = type.getPort(base);
-            if (p != null && p.isBus())
-                return base + "[" + Integer.parseInt(name.substring(i)) + "]";
+            // Split flat "<BUS><index>" into bus + index.  Stripping ALL trailing
+            // digits is WRONG when a cell has both <BUS> and <BUS><digit> ports:
+            // a GTXE2_CHANNEL declares PCSRSVDIN[15:0] AND PCSRSVDIN2[4:0], so
+            // nextpnr's "PCSRSVDIN20" (= PCSRSVDIN2 bit 0) got read as
+            // PCSRSVDIN[20].  Index 20 on a 16-wide bus then produced a NEGATIVE
+            // EDIF member -- (portref (member PCSRSVDIN -5) ...) -- and Vivado
+            // rejected the whole netlist with
+            //   [EDIF 20-86] Cannot find port 'PCSRSVDIN' ... of cell 'GTXE2_CHANNEL'
+            // naming the bus, which sent me looking at the bus machinery rather
+            // than at the index.  Indices 20..24 were exactly PCSRSVDIN2[4:0].
+            //
+            // So try the split points from the RIGHT -- fewest index digits first,
+            // i.e. longest base first -- and take the first that names a real bus
+            // with the index IN RANGE.  PCSRSVDIN2+"0" wins over PCSRSVDIN+"20";
+            // RXDATA13 still resolves to RXDATA[13] because there is no RXDATA1.
+            for (int cut = name.length() - 1; cut > 0; cut--) {
+                if (!Character.isDigit(name.charAt(cut)))
+                    break;                         // ran past the trailing digits
+                EDIFPort p = type.getPort(name.substring(0, cut));
+                if (p == null || !p.isBus())
+                    continue;
+                int idx;
+                try { idx = Integer.parseInt(name.substring(cut)); }
+                catch (NumberFormatException nfe) { continue; }
+                if (idx >= 0 && idx < p.getWidth())
+                    return name.substring(0, cut) + "[" + idx + "]";
+            }
             return name;
         } catch (RuntimeException ex) {
             return name;
@@ -532,6 +554,13 @@ public class json2dcp {
                 String log_bus = logical_pin.substring(0, open_pos);
                 int port_index = Integer.parseInt(logical_pin.substring(open_pos + 1, logical_pin.length() - 1));
                 int bus_width = cell.getEDIFCellInst().getPort(log_bus).getWidth();
+                // An out-of-range index silently becomes a NEGATIVE EDIF member,
+                // which Vivado only rejects when it READS the checkpoint -- and it
+                // blames the bus, not the index.  Refuse here instead.
+                if (port_index < 0 || port_index >= bus_width)
+                    throw new RuntimeException("bus index out of range: " + logical_pin
+                            + " on " + log_bus + "[" + (bus_width - 1) + ":0] of "
+                            + cell.getName());
                 epi = net.getLogicalNet().createPortInst(log_bus, (bus_width - 1) - port_index, cell.getEDIFCellInst());
                 //System.out.println(net.getName() + " -L-> " + epi.getName());
 
@@ -821,7 +850,29 @@ public class json2dcp {
                 Map<String, String> map = nc.rwCell.getPinMappingsP2L();
                 Object[] pins = map.keySet().toArray();
 
-                if (unitype != Unisim.PS8) {
+                // X_ORIG_PORT_<phys> records nextpnr's REPACK mapping, and this
+                // rebuilds the cell's physical->logical map from it.  But a cell
+                // nextpnr never repacked carries NO X_ORIG_PORT at all -- its type
+                // already IS the Unisim.  That is every hard block: GTXE2_CHANNEL,
+                // GTXE2_COMMON, IBUFDS_GTE2.  Clearing the defaults and then
+                // finding nothing to re-add left them with ZERO pin mappings:
+                // measured on ethmin, 539 connected CHANNEL ports and 23 COMMON
+                // ports became 0 and 0.  Vivado then reports ~22 of
+                //   [DRC PDCN-*] <pin>_connects: On GTXE2_CHANNEL_X1Y1, pin <pin>
+                //                                must be connected
+                // plus [DRC RTSTAT-4] 32 nets with no routable drivers (the GT's
+                // own outputs -- rxdata_rec[15:0], gtxe2_i_n_*, rxoutclk, txoutclk),
+                // and a placed hard block with no pin mappings is exactly the null
+                // logical net that segfaults HDPYRoutedSiteBuilder::newRoutedSite.
+                //
+                // For such a cell RapidWright's DEFAULT map is already right --
+                // physical pin name equals logical pin name, bus indices included --
+                // so the correct action is to leave it alone, not to rebuild it.
+                boolean hasRepack = false;
+                for (String k : nc.attrs.keySet())
+                    if (k.startsWith("X_ORIG_PORT_")) { hasRepack = true; break; }
+
+                if (unitype != Unisim.PS8 && hasRepack) {
                     for (Object p : pins)
                         nc.rwCell.removePinMapping(p.toString());
                     for (NextpnrCellPort p : nc.ports.values()) {
@@ -836,6 +887,15 @@ public class json2dcp {
                             }
                     }
 
+                } else if (unitype != Unisim.PS8) {
+                    // Hard block (no X_ORIG_PORT): keep RapidWright's default map
+                    // for now.  It cannot be filtered HERE -- nets are connected
+                    // later in main(), so the test that matters ("does this
+                    // logical port actually have a net?") has no answer yet.
+                    // prune_dangling_pinmaps() below does it once the EDIF is
+                    // complete.
+                    keptDefaultPinmap++;
+                    keptDefaultPins += pins.length;
                 }
 
                 for (Map.Entry<String, String> param : nc.params.entrySet()) {
@@ -1031,6 +1091,74 @@ public class json2dcp {
                             //n.connect(usr.cell.rwCell, orig);
                         }
                     } else {
+                        // NEVER-REPACKED CELLS (hard blocks) NEED THE LOGICAL EDGE TOO.
+                        //
+                        // A cell nextpnr never repacked carries no X_ORIG_PORT at
+                        // all -- its type already IS the Unisim.  This branch used
+                        // to give such a sink ONLY a physical site pin, so the GT's
+                        // inputs were wired in the physical netlist and nowhere in
+                        // the EDIF: measured on ethmin, just 34 of 744 GT pin
+                        // mappings had a live logical net.  Vivado then walks the
+                        // pin map, hits the 710 with none, and segfaults in
+                        // HDPYRoutedSiteBuilder::newRoutedSite -- and reports ~22
+                        // PDCN "pin must be connected" for good measure.
+                        //
+                        // The driver branch above already learned this (it used to
+                        // `continue` and orphan the whole net); this is the same
+                        // fix for SINKS.  Gate on the cell having NO X_ORIG_PORT_*
+                        // anywhere, which is exactly "never repacked" -- a packed
+                        // LUT has them for its other pins, so the fractured-LUT
+                        // A6-tie case below still behaves as before.
+                        boolean neverRepacked = true;
+                        for (String k : usr.cell.attrs.keySet())
+                            if (k.startsWith("X_ORIG_PORT_")) { neverRepacked = false; break; }
+                        // Only when the EDIF really has that port.  resolve_edif_pin
+                        // passes a name through unchanged when it cannot improve it,
+                        // and connect_log_and_phys accepts it silently -- the bad
+                        // name then surfaces only when Vivado READS the checkpoint:
+                        //   [EDIF 20-86] Cannot find port 'PCSRSVDIN' on instance
+                        //   ... of cell 'GTXE2_CHANNEL'
+                        // PCSRSVDIN is a BUS, and a bus referenced without an index
+                        // is not a port.  Check before connecting, not after.
+                        if (neverRepacked) {
+                            String edifPin = resolve_edif_pin(usr.cell.rwCell, usr.name);
+                            EDIFCellInst ci = usr.cell.rwCell.getEDIFCellInst();
+                            boolean portOk = false;
+                            if (ci != null && ci.getCellType() != null && edifPin != null) {
+                                int br = edifPin.indexOf('[');
+                                String base = (br > 0 && edifPin.endsWith("]"))
+                                        ? edifPin.substring(0, br) : edifPin;
+                                EDIFPort ep = ci.getCellType().getPort(base);
+                                // a bus needs an index; a scalar must not have one
+                                portOk = ep != null && (ep.isBus() == (br > 0));
+                                // BUS MEMBERS ARE OFF BY DEFAULT.  Connecting them
+                                // makes Vivado reject the EDIF outright at read time:
+                                //   [EDIF 20-86] Cannot find port 'PCSRSVDIN' on
+                                //   instance ... of cell 'GTXE2_CHANNEL'
+                                // even though the cell DOES declare PCSRSVDIN[15:0]
+                                // and connect_log_and_phys_impl takes the
+                                // createPortInst(bus, index, inst) path for names
+                                // ending in ']'.  So the member reference is being
+                                // emitted in a form Vivado will not read, and that is
+                                // a separate bug from the missing connections.
+                                // Scalars alone already cover most of the PDCN
+                                // complaints (CPLLRESET, DRPCLK, GTRXRESET, RXUSRCLK,
+                                // TXUSRCLK...).  J2D_HARD_SINK_BUS=1 to include buses.
+                                if (br > 0 && System.getenv("J2D_HARD_SINK_BUS") == null)
+                                    portOk = false;
+                            }
+                            if (portOk) {
+                                try {
+                                    connect_log_and_phys(n, usr.cell.rwCell, edifPin);
+                                    hardSinkLogical++;
+                                    continue;
+                                } catch (RuntimeException ex) {
+                                    hardSinkFailed++;   // fall through to physical-only
+                                }
+                            } else {
+                                hardSinkNoPort++;
+                            }
+                        }
                         // Special case where no logical pin exists, mostly where we tie A6 high for a fractured LUT
                         BELPin belPin = usr.cell.rwCell.getBEL().getPin(usr.name);
                         if (belPin != null && belPin.getConnectedSitePinName() != null) {
@@ -2156,6 +2284,64 @@ public class json2dcp {
                     } catch (RuntimeException ex) { /* no such port on this flavour */ }
                 }
             }
+        if (hardSinkLogical > 0 || hardSinkFailed > 0)
+            System.out.println("[hard-sink] logically connected " + hardSinkLogical
+                    + " sink pin(s) on never-repacked cells (" + hardSinkFailed + " failed, "
+                    + hardSinkNoPort + " with no matching EDIF port)");
+
+        // ------------------------------------------------------------------
+        // PRUNE DANGLING PIN MAPPINGS on never-repacked hard blocks.
+        //
+        // Vivado builds a routed-site model by walking each placed cell's
+        // physical->logical pin map and taking the LOGICAL NET behind every
+        // entry.  A mapping whose logical port has no net gives it a null and it
+        // dies:  HDLHNet::getSigType <- HDPYNetProxy
+        //                            <- HDPYRoutedSiteBuilder::newRoutedSite
+        //
+        // RapidWright's default map covers EVERY bel pin of the block (628 on a
+        // GTXE2_CHANNEL), so most entries are danglers.  Two filters were tried
+        // and BOTH still crashed, identically: keeping all defaults, and keeping
+        // those whose nextpnr port had a net.  The second was still wrong,
+        // because a nextpnr-side net does not guarantee the connection SURVIVED
+        // into the EDIF -- resolve_edif_pin can fail to find the port, and the
+        // macro path makes physical-only Nets whose getLogicalNet() is null by
+        // construction.
+        //
+        // So test the real thing, after the netlist is complete: keep a mapping
+        // only if the EDIF cell instance actually has a PortInst for that logical
+        // pin.  That is exactly what Vivado dereferences.
+        // ------------------------------------------------------------------
+        {
+            int pruned = 0, kept = 0;
+            for (NextpnrCell nc : ndes.cells.values()) {
+                if (nc.rwCell == null) continue;
+                boolean hasRepack = false;
+                for (String k : nc.attrs.keySet())
+                    if (k.startsWith("X_ORIG_PORT_")) { hasRepack = true; break; }
+                if (hasRepack) continue;                 // repacked cells were rebuilt already
+                EDIFCellInst inst = nc.rwCell.getEDIFCellInst();
+                if (inst == null) continue;
+                for (Object po : nc.rwCell.getPinMappingsP2L().keySet().toArray()) {
+                    String phys = po.toString();
+                    String logical = nc.rwCell.getPinMappingsP2L().get(phys);
+                    boolean live = false;
+                    if (logical != null) {
+                        EDIFPortInst pi = inst.getPortInst(logical);
+                        live = pi != null && pi.getNet() != null;
+                    }
+                    if (live) kept++;
+                    else { nc.rwCell.removePinMapping(phys); pruned++; }
+                }
+            }
+            if (pruned > 0 || kept > 0)
+                System.out.println("[pinmap] hard blocks: kept " + kept
+                        + " pin mapping(s) with a live logical net, pruned " + pruned + " dangling");
+        }
+
+            if (keptDefaultPinmap > 0)
+                System.out.println("[pinmap] kept RapidWright default pin map on " + keptDefaultPinmap
+                        + " never-repacked cell(s): " + keptDefaultPins + " connected pin(s) kept, "
+                        + keptDroppedPins + " unconnected dropped -- hard blocks carry no X_ORIG_PORT");
             if (tiedRef > 0)
                 System.out.println("[gt-refclk] reconnected " + tiedRef
                         + " GTREFCLK pin(s) that nextpnr left implicit");
