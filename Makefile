@@ -7,8 +7,9 @@
 #
 #   make            fetch what is missing, then build the jars
 #   make deps       fetch/generate the inputs only (jar, gson, device data, oracle)
-#   make jars       rebuild our three jars from src/
+#   make jars       rebuild our eight tool jars from src/
 #   make verify     prove the result actually runs
+#   make dist       build a portable tarball of the whole bundle
 #   make clean      remove build output (jars, classes)
 #   make distclean  also remove fetched/generated inputs
 #
@@ -40,13 +41,17 @@ export RAPIDWRIGHT_PATH := $(CURDIR)/data
 
 CP      := $(RW_JAR):$(GSON)
 # Sources that go into the jars.  FetchDevice is a build-time helper and is
-# compiled with them so it lands in the same class tree.
+# compiled with them so it lands in the same class tree.  src/attic/ is NOT
+# built: one-off probes from finished campaigns, kept for reference only.
 SRCS    := src/WireOracle.java src/json2dcp.java src/dcp2fasm.java \
-           src/json_drc.java src/FetchDevice.java
-JARS    := lib/rapidwright_json_drc.jar lib/rapidwright_json2dcp.jar \
-           lib/rapidwright_dcp2fasm.jar
+           src/json_drc.java src/FetchDevice.java \
+           src/dcp2xml.java src/xml2dcp.java src/xml2json.java \
+           src/xml2fasm.java src/dcp2routes.java
+# One class tree, one jar per entry point -- see the pattern rule below.
+TOOLS   := json_drc json2dcp dcp2fasm dcp2xml xml2dcp xml2json xml2fasm dcp2routes
+JARS    := $(patsubst %,lib/rapidwright_%.jar,$(TOOLS))
 
-.PHONY: all deps jars verify clean distclean help
+.PHONY: all deps jars verify dist clean distclean help
 .DELETE_ON_ERROR:          # a truncated download must not look like a success
 
 all: jars
@@ -93,21 +98,20 @@ $(ORACLE): $(RW_JAR) src/BuildWireOracle.java | $(DEVSTAMP)
 	@mv $@.tmp $@
 
 # --- our jars ---------------------------------------------------------------
-# One compile, three manifests: the classes are shared, only Main-Class differs.
+# One compile, N manifests: the classes are shared, only Main-Class differs.
 
 $(CLASSES)/.built: $(SRCS) $(RW_JAR) $(GSON)
 	@mkdir -p $(CLASSES)
 	$(JAVAC) -d $(CLASSES) -cp $(CP) $(SRCS)
 	@touch $@
 
-lib/rapidwright_json_drc.jar: $(CLASSES)/.built src/manifest_json_drc.mf
-	$(JAR) cfm $@ src/manifest_json_drc.mf -C $(CLASSES) dev
-
+# json2dcp's manifest is manifest.mf, not manifest_json2dcp.mf, for historical
+# reasons; every other tool follows the pattern.
 lib/rapidwright_json2dcp.jar: $(CLASSES)/.built src/manifest.mf
 	$(JAR) cfm $@ src/manifest.mf -C $(CLASSES) dev
 
-lib/rapidwright_dcp2fasm.jar: $(CLASSES)/.built src/manifest_dcp2fasm.mf
-	$(JAR) cfm $@ src/manifest_dcp2fasm.mf -C $(CLASSES) dev
+lib/rapidwright_%.jar: $(CLASSES)/.built src/manifest_%.mf
+	$(JAR) cfm $@ src/manifest_$*.mf -C $(CLASSES) dev
 
 jars: $(JARS)
 
@@ -126,6 +130,28 @@ verify: $(JARS) $(DEVSTAMP) $(ORACLE)
 	@$(JAVA) -cp lib/rapidwright_json_drc.jar:$(CP) dev.fpga.rapidwright.json_drc 2>&1 \
 	   | head -3
 	@echo "OK"
+
+# --- distribution -----------------------------------------------------------
+# Replaces the old src/package_json_drc.sh, which assembled the tarball by
+# copying out of ~/rapidwright and carried its own duplicate copies of README.md
+# and src/SOURCES.md as heredocs -- so the shipped docs could drift from the
+# real ones.  The working tree IS the bundle now: build it, then tar it.
+#
+# Stamped from the last commit date rather than the wall clock, so repackaging
+# the same commit gives the same name.
+
+DIST_STAMP := $(shell git log -1 --format=%cd --date=format:%Y%m%d 2>/dev/null || echo snapshot)
+DIST_NAME  := json_drc-portable-$(DIST_STAMP)
+
+dist: jars $(DEVSTAMP) $(ORACLE)
+	@rm -rf /tmp/$(DIST_NAME) && mkdir -p /tmp/$(DIST_NAME)
+	@tar -c --exclude-vcs --exclude=work --exclude=artifacts --exclude=$(CLASSES) \
+	     --exclude='src/attic' Makefile README.md run.sh src lib data oracle \
+	   | tar -x -C /tmp/$(DIST_NAME)
+	@tar -C /tmp -czf /tmp/$(DIST_NAME).tar.gz $(DIST_NAME)
+	@rm -rf /tmp/$(DIST_NAME)
+	@ls -lh /tmp/$(DIST_NAME).tar.gz
+	@echo "Unpack: tar -xzf $(DIST_NAME).tar.gz && cd $(DIST_NAME) && ./run.sh --help"
 
 clean:
 	rm -rf $(CLASSES) $(JARS) src/*.jar src/dev

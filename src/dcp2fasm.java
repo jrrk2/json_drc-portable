@@ -20,6 +20,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -71,10 +73,24 @@ public class dcp2fasm {
         Design des = Design.readCheckpoint(args[0]);
         parseBundledXdc(args[0]);
         PrintStream out = new PrintStream(new FileOutputStream(args[1]));
+        emitDesign(des, out, args.length > 2 ? args[2] : null);
+    }
 
+    /** Emit FASM from an already-built Design (used by dcp2fasm and xml2fasm).
+     *  Walks SiteInsts for cell/site config and Nets for routing PIPs -- needs
+     *  only the physical state (cells, SitePIPs, PIPs), NOT the intra-site net
+     *  occupancy, so it works on the Design xml2dcp reconstructs from opendcp
+     *  XML even though writeCheckpoint can't (the RapidWright site-wire-setter
+     *  gap is irrelevant to feature-based FASM). */
+    public static void emitDesign(Design des, PrintStream out, String sitepipsFile) throws Exception {
         // Group everything by tile so the output is stable and groupable
         // by-tile (matches nextpnr's FASM grouping convention).
         Map<String, List<String>> byTile = new TreeMap<>();
+
+        // Harvest IOSTANDARD/DRIVE/SLEW/PULLTYPE from the Design's constraint
+        // list -- covers both the DCP path (RapidWright loads the bundled XDC)
+        // and the xml2fasm path (xml2dcp loaded the opendcp <constraints>).
+        parseDesignXdc(des);
 
         for (SiteInst si : des.getSiteInsts()) {
             String stype = si.getSiteTypeEnum().name();
@@ -86,7 +102,11 @@ public class dcp2fasm {
                 emitBufg(si, byTile);
             } else if (stype.startsWith("BUFR") || stype.startsWith("BUFIO")) {
                 bump("BUF:" + stype);
-            } else if (stype.startsWith("MMCM") || stype.startsWith("PLL")) {
+            } else if (stype.startsWith("RAMB") || stype.startsWith("FIFO")) {
+                emitBram(si, byTile);
+            } else if (stype.startsWith("MMCM")) {
+                emitMmcm(si, byTile);
+            } else if (stype.startsWith("PLL")) {
                 bump("CLOCK:" + stype);
             } else if (stype.startsWith("ILOGICE") || stype.startsWith("OLOGICE")) {
                 emitIolConfig(si, byTile);
@@ -95,24 +115,78 @@ public class dcp2fasm {
             }
         }
 
+        // Optional Vivado sitepips side-file (dump_sitepips.tcl).
+        // RapidWright drops dangling OUTMUX site pips (mux programmed
+        // but output pin unrouted) from getUsedSitePIPs(); Vivado's own
+        // IS_USED dump is ground truth -- emit any OUTMUX selections we
+        // missed.  Duplicates are removed at output time.
+        if (sitepipsFile != null) {
+            BufferedReader br = new BufferedReader(
+                new java.io.FileReader(sitepipsFile));
+            String ln;
+            int extra = 0;
+            while ((ln = br.readLine()) != null) {
+                ln = ln.trim();
+                int slash = ln.indexOf('/'), colon = ln.indexOf(':');
+                if (slash < 0 || colon < slash) continue;
+                String siteName = ln.substring(0, slash);
+                String belName = ln.substring(slash + 1, colon);
+                String pinName = ln.substring(colon + 1);
+                if (!belName.endsWith("OUTMUX")) continue;
+                SiteInst si = des.getSiteInstFromSiteName(siteName);
+                if (si == null) continue;
+                String feat = si.getTile().getName() + "." + getHalfTag(si)
+                            + "." + belName + "." + pinName;
+                List<String> tl = byTile.get(si.getTile().getName());
+                if (tl == null || !tl.contains(feat)) {
+                    addLine(byTile, si.getTile().getName(), feat);
+                    extra++;
+                }
+            }
+            br.close();
+            System.err.println("[dcp2fasm] sitepips side-file: " + extra
+                + " OUTMUX features recovered");
+        }
+
         // Routing-PIP emission -- walk every Net's PIPs and emit the
         // tile-prefixed dst.src line plus any pseudo-pip substitutions.
         emitRouting(des, byTile);
 
+        emitGclkActive(des, byTile);
         emitIobColBankActive(des, byTile);
         emitHclkIoConfig(byTile);
         emitNoClkInvDefaults(des, byTile);
 
+        // BRAM address-cascade activity: Vivado sets CASCOUT_*_ACTIVE
+        // whenever a tile's BRAM_CASCOUT_ADDR* wires carry a routed
+        // signal (fasm.cc does the same from used wires).  Detect from
+        // the pip features already emitted for the tile.
+        for (Map.Entry<String, List<String>> e : byTile.entrySet()) {
+            String tile = e.getKey();
+            if (!tile.startsWith("BRAM_L") && !tile.startsWith("BRAM_R")) continue;
+            boolean ard = false, bwr = false;
+            for (String l : e.getValue()) {
+                if (l.contains("BRAM_CASCOUT_ADDRARDADDR")) ard = true;
+                if (l.contains("BRAM_CASCOUT_ADDRBWRADDR")) bwr = true;
+            }
+            if (ard) e.getValue().add(tile + ".CASCOUT_ARD_ACTIVE");
+            if (bwr) e.getValue().add(tile + ".CASCOUT_BWR_ACTIVE");
+        }
+
         for (Map.Entry<String, List<String>> e : byTile.entrySet()) {
             Collections.sort(e.getValue());
-            for (String line : e.getValue()) out.println(line);
+            String prev = null;
+            for (String line : e.getValue()) {
+                if (!line.equals(prev)) out.println(line);
+                prev = line;
+            }
             out.println();
         }
         out.close();
 
         System.err.println("[dcp2fasm] luts=" + lutCount + " ffs=" + ffCount
             + " iobs=" + iobCount + " bufgs=" + bufgCount
-            + " iol=" + iolCount + " pips=" + pipCount);
+            + " iol=" + iolCount + " brams=" + bramCount + " pips=" + pipCount);
         if (!skipped.isEmpty()) {
             System.err.println("[dcp2fasm] skipped categories (not yet emitted):");
             for (Map.Entry<String,Integer> e : skipped.entrySet()) {
@@ -166,8 +240,22 @@ public class dcp2fasm {
         // GND (or routed from below).  Detect by looking at the CARRY4
         // BEL's CYINIT site-pin source.  For CARRY chains > 1 high,
         // PRECYINIT.CIN selects the previous carry-out as the carry-in.
+        // Site wires carrying the global VCC net: an empty LUT slot
+        // whose O6 wire is VCC is a static logic-1 source (Vivado
+        // programs INIT = all-ones with no logical cell present).
+        Set<String> vccWires = new HashSet<>();
+        try {
+            List<String> vw = si.getSiteWiresFromNet(si.getDesign().getVccNet());
+            if (vw != null) vccWires.addAll(vw);
+        } catch (Exception ex) { /* no vcc net */ }
+
         // -- per-letter LUT INIT + FF config --------------------------
         boolean ffAny = false;
+        if (si.getBEL("WEMUX") != null) {
+            com.xilinx.rapidwright.device.SitePIP wePip = si.getUsedSitePIP("WEMUX");
+            if (wePip != null)
+                addLine(byTile, tn, prefix + "WEMUX." + wePip.getInputPinName());
+        }
         // For the slice summary bits.
         boolean anyFFSync = false;     // FDRE/FDSE family
         boolean anyClkInv = false;
@@ -175,22 +263,10 @@ public class dcp2fasm {
         boolean anySRUsed = false;
         boolean anyCEUsed = false;
         boolean anyLatch = false;
+        boolean wa7Used = false;       // dist-RAM high write-address pins
+        boolean wa8Used = false;
 
         for (char L : new char[]{'A','B','C','D'}) {
-            // CARRY4 routethru: Vivado packs DI buffer LUTs as
-            // routethrus on the existing CARRY4 cell.  RapidWright marks
-            // these with cell.isRoutethru() and the cell.getType() of
-            // "CARRY4" (not a LUT type), so they bypass the regular
-            // LUT-INIT path below.  The bitstream representation is a
-            // buffer LUT (output = A6 input), encoded as INIT bits
-            // [63:32] = 1, [31:0] = 0  ->  INIT = 0xffffffff00000000.
-            Cell rthru6 = si.getCell(L + "6LUT");
-            if (rthru6 != null && rthru6.isRoutethru()
-                && !isLutType(rthru6.getType())) {
-                addLine(byTile, tn, prefix + L + "LUT.INIT[63:0] = 64'b"
-                    + repeat('1', 32) + repeat('0', 32));
-                lutCount++;
-            }
             // OUTMUX SitePIP -- selects which intra-site signal drives
             // the slice's <L>MUX output pin.  fasm.cc emits these as
             // routing-bel features alongside the LUT INIT.  When the
@@ -200,7 +276,16 @@ public class dcp2fasm {
             com.xilinx.rapidwright.device.SitePIP omuxPip = si.getUsedSitePIP(outmuxBel);
             if (omuxPip != null) {
                 addLine(byTile, tn, prefix + outmuxBel + "." + omuxPip.getInputPinName());
-            } else if (si.getCell(L + "6LUT") != null) {
+            } else if (si.getCell(L + "6LUT") != null
+                       && isLutType(si.getCell(L + "6LUT").getType())
+                       && lutOutputUsesOutmux(si, si.getCell(L + "6LUT"), L, half)) {
+                // Vivado/RapidWright DROPS the xMUX output site pin AND the
+                // <L>OUTMUX SitePIP on load, so neither omuxPip nor the
+                // <L>MUX SitePinInst is visible.  Detect OUTMUX.O6 from ROUTING:
+                // the LUT6 output net routes INTO this slice's <L>MUX wire
+                // (the OUTMUX output).  A LUT output exiting via the DIRECT <L>
+                // pin instead does NOT use the OUTMUX, so only the xMUX-egress
+                // case sets the bit -- matching golden.
                 addLine(byTile, tn, prefix + outmuxBel + ".O6");
             }
             // DI1MUX (SLICEM-only): selects the carry-chain data-in
@@ -210,8 +295,13 @@ public class dcp2fasm {
             if (si.getBEL(di1muxBel) != null) {
                 com.xilinx.rapidwright.device.SitePIP di1Pip = si.getUsedSitePIP(di1muxBel);
                 if (di1Pip != null) {
+                    String ip = di1Pip.getInputPinName();
+                    // DB names the cascade options structurally
+                    if (L == 'A' && !ip.equals("AI")) ip = "BDI1_BMC31";
+                    if (L == 'B' && !ip.equals("BI")) ip = "DI_CMC31";
+                    if (L == 'C' && !ip.equals("CI")) ip = "DI_DMC31";
                     addLine(byTile, tn,
-                        prefix + L + "LUT.DI1MUX." + di1Pip.getInputPinName());
+                        prefix + L + "LUT.DI1MUX." + ip);
                 }
             }
             Cell lut6 = si.getCell(L + "6LUT");
@@ -220,11 +310,67 @@ public class dcp2fasm {
             // the LUT pair (LUT6 + LUT5) contribute to the same FASM
             // line `<slot>LUT.INIT[63:0]`; when only one half is used the
             // other is treated as "always 0" via the per-cell expansion.
-            if (lut6 != null || lut5 != null) {
-                String bits = lutSlotInitBits(L, lut6, lut5);
+            boolean isSrl = false, isSmallSrl = false;
+            boolean isRam = false, isSmallRam = false;
+            Cell srlCell = null;
+            for (Cell lc : new Cell[]{lut6, lut5}) {
+                if (lc == null) continue;
+                String ty = lc.getType();
+                if ("SRLC32E".equals(ty)) { isSrl = true; srlCell = lc; }
+                if ("SRL16E".equals(ty)) { isSrl = true; isSmallSrl = true; srlCell = lc; }
+                if ("RAMD64E".equals(ty) || "RAMS64E".equals(ty)) isRam = true;
+                if ("RAMD32".equals(ty) || "RAMS32".equals(ty)) { isRam = true; isSmallRam = true; }
+                // WA7/WA8 only count as used when the mapped logical
+                // pin carries a real signal (RAM128/RAM256 deep RAMs);
+                // a bare physical pin mapping on RAM32/RAM64 cells does
+                // not set the bit in golden bitstreams.
+                Map<String,String> p2l = lc.getPinMappingsP2L();
+                String wl7 = p2l.get("WA7"), wl8 = p2l.get("WA8");
+                if (wl7 != null && cellPinDrivenByLogic(lc, wl7)) wa7Used = true;
+                if (wl8 != null && cellPinDrivenByLogic(lc, wl8)) wa8Used = true;
+            }
+            if (isSrl) {
+                addLine(byTile, tn, prefix + L + "LUT.SRL");
+                if (isSmallSrl) addLine(byTile, tn, prefix + L + "LUT.SMALL");
+                // SRL INIT bit k occupies LUT INIT bits 2k and 2k+1
+                int srlBits = isSmallSrl ? 16 : 32;
+                String sb = hexPropToBits(srlCell, "INIT", srlBits);
+                char[] init = new char[64];
+                Arrays.fill(init, '0');
+                if (sb != null) {
+                    for (int k = 0; k < srlBits; k++) {
+                        if (sb.charAt(srlBits - 1 - k) == '1') {
+                            init[63 - (2 * k)] = '1';
+                            init[63 - (2 * k + 1)] = '1';
+                        }
+                    }
+                }
+                addLine(byTile, tn, prefix + L + "LUT.INIT[63:0] = 64'b" + new String(init));
+                lutCount++;
+            } else if (lut6 != null || lut5 != null) {
+                // When the slot's A6 site wire is tied to VCC the LUT is
+                // fractured (O5 in use, e.g. CARRY4 xCY0.O5): the 6LUT
+                // cell owns only INIT[63:32] even with no 5LUT cell --
+                // the low half belongs to the (possibly static) O5.
+                boolean frac6 = vccWires.contains(L + "6");
+                String bits = lutSlotInitBits(L, lut6, lut5, frac6);
+                // Static VCC on the O6 half alongside a real LUT5 cell
+                if (lut6 == null && vccWires.contains(L + "6LUT_O6"))
+                    bits = repeat('1', 32) + bits.substring(32);
+                // Static VCC on the O5 half (no 5LUT cell)
+                if (lut5 == null && vccWires.contains(L + "5LUT_O5"))
+                    bits = bits.substring(0, 32) + repeat('1', 32);
                 addLine(byTile, tn, prefix + L + "LUT.INIT[63:0] = 64'b" + bits);
-                if (lut6 != null && isLutType(lut6.getType())) lutCount++;
-                if (lut5 != null && isLutType(lut5.getType())) lutCount++;
+                if (isRam) {
+                    addLine(byTile, tn, prefix + L + "LUT.RAM");
+                    if (isSmallRam) addLine(byTile, tn, prefix + L + "LUT.SMALL");
+                }
+                if (lut6 != null) lutCount++;
+                if (lut5 != null) lutCount++;
+            } else if (vccWires.contains(L + "6LUT_O6")) {
+                // Cell-less static logic-1 LUT
+                addLine(byTile, tn, prefix + L + "LUT.INIT[63:0] = 64'b" + repeat('1', 64));
+                lutCount++;
             }
 
             // FFs at *FF and *5FF
@@ -287,6 +433,14 @@ public class dcp2fasm {
             // PRECYINIT.C0 on every touched slice.
             Cell carry4 = si.getCell("CARRY4");
             if (carry4 != null) {
+                // Per-row DI source: <L>CY0 sitepip on O5 selects the
+                // 5LUT O5 output as the carry DI (bit set); on the
+                // bypass pin (AX/BX/CX/DX) the bit stays clear.
+                for (char L : new char[]{'A','B','C','D'}) {
+                    com.xilinx.rapidwright.device.SitePIP cy0 = si.getUsedSitePIP(L + "CY0");
+                    if (cy0 != null && "O5".equals(cy0.getInputPinName()))
+                        addLine(byTile, tn, prefix + "CARRY4." + L + "CY0");
+                }
                 com.xilinx.rapidwright.device.SitePIP precy = si.getUsedSitePIP("PRECYINIT");
                 if (precy != null) {
                     String pin = precy.getInputPinName();
@@ -308,6 +462,8 @@ public class dcp2fasm {
             if (anySRUsed) addLine(byTile, tn, prefix + "SRUSEDMUX");
             if (anyCEUsed) addLine(byTile, tn, prefix + "CEUSEDMUX");
         }
+        if (wa7Used) addLine(byTile, tn, prefix + "WA7USED");
+        if (wa8Used) addLine(byTile, tn, prefix + "WA8USED");
     }
 
     // Determine the ZINI / ZRST polarity bits.  Mirrors fasm.cc:
@@ -389,6 +545,66 @@ public class dcp2fasm {
         return true;
     }
 
+    // True when a LUT cell's output net routes INTO this slice's <L>MUX wire
+    // (the OUTMUX output) -> the OUTMUX selects O6.  Detected from the net's
+    // PIPs (RapidWright drops the xMUX site pin + SitePIP on load).  A LUT
+    // output exiting via the DIRECT <L> pin does NOT match.
+    static boolean lutOutputUsesOutmux(SiteInst si, Cell lut, char L, String half) {
+        if (lut == null) return false;
+        com.xilinx.rapidwright.edif.EDIFCellInst inst = lut.getEDIFCellInst();
+        if (inst == null) return false;
+        com.xilinx.rapidwright.edif.EDIFPortInst po = inst.getPortInst("O");
+        if (po == null) return false;
+        com.xilinx.rapidwright.edif.EDIFNet en = po.getNet();
+        if (en == null) return false;
+        Design des = si.getDesign();
+        if (des == null) return false;
+        String local = en.getName();
+        String parent = "";
+        try {
+            com.xilinx.rapidwright.edif.EDIFHierCellInst ehci = lut.getEDIFHierCellInst();
+            if (ehci != null && ehci.getParent() != null)
+                parent = ehci.getParent().getFullHierarchicalInstName();
+        } catch (Throwable t) {}
+        Net pn = null;
+        if (parent != null && !parent.isEmpty()) pn = des.getNet(parent + "/" + local);
+        if (pn == null) pn = des.getNet(local);
+        if (pn == null || pn.getPIPs() == null) return false;
+        // this slice's xMUX wire name.  X1 (SLICEL) uses the tile-type prefix
+        // directly (CLBLM_L_BMUX); X0 uses the M/LL variant (CLBLM_M_BMUX /
+        // CLBLL_LL_BMUX).
+        // The xMUX wire prefix is normalized by SITE position and is INDEPENDENT
+        // of the tile's _L/_R suffix: a CLBLM_R tile's X1 SLICEL still uses the
+        // CLBLM_L_ prefix (not CLBLM_R_).  CLBLM X1->CLBLM_L, X0->CLBLM_M;
+        // CLBLL X1->CLBLL_L, X0->CLBLL_LL.
+        String tt = si.getTile().getName().replaceAll("_X\\d+Y\\d+$", "");
+        boolean isM = tt.startsWith("CLBLM");
+        boolean x1 = half.endsWith("_X1");
+        String xmuxWire = (x1 ? (isM ? "CLBLM_L" : "CLBLL_L")
+                              : (isM ? "CLBLM_M" : "CLBLL_LL")) + "_" + L + "MUX";
+        String myTile = si.getTile().getName();
+        for (com.xilinx.rapidwright.device.PIP p : pn.getPIPs()) {
+            if (!p.getTile().getName().equals(myTile)) continue;
+            if (xmuxWire.equals(p.getEndWireName()) || xmuxWire.equals(p.getStartWireName()))
+                return true;
+        }
+        return false;
+    }
+
+    // True when the named logical pin is tied to the VCC const net.
+    static boolean cellPinTiedToVcc(Cell c, String pinName) {
+        if (c == null) return false;
+        com.xilinx.rapidwright.edif.EDIFCellInst inst = c.getEDIFCellInst();
+        if (inst == null) return false;
+        com.xilinx.rapidwright.edif.EDIFPortInst portInst = inst.getPortInst(pinName);
+        if (portInst == null) return false;
+        com.xilinx.rapidwright.edif.EDIFNet net = portInst.getNet();
+        if (net == null) return false;
+        String nm = net.getName();
+        return nm != null && (nm.equals("VCC") || nm.equals("<const1>")
+                              || nm.equals("$PACKER_VCC_NET"));
+    }
+
     static boolean hasSRNet(Cell ff) {
         for (String n : new String[]{"R","S","CLR","PRE"}) {
             if (cellPinDrivenByLogic(ff, n)) return true;
@@ -417,21 +633,19 @@ public class dcp2fasm {
     // bit physical truth table and OR them together (LUT5 only ever
     // writes the low 32 bits, gated on physical A6 == 0; LUT6 writes
     // all 64).
-    static String lutSlotInitBits(char slot, Cell lut6, Cell lut5) {
+    static String lutSlotInitBits(char slot, Cell lut6, Cell lut5, boolean frac6) {
         long phys = 0;
-        boolean paired = lut6 != null && isLutType(lut6.getType())
-                       && lut5 != null && isLutType(lut5.getType());
-        // Bit-range ownership (matches fasm.cc:514-517):
-        //   paired:  LUT6 owns bits 32..63 (A6=1 half), LUT5 owns 0..31
-        //   solo:    whichever cell is present owns the full 64
-        if (lut6 != null && isLutType(lut6.getType())) {
+        boolean paired = (lut6 != null && lut5 != null) || frac6;
+        // Bit-range ownership:
+        //   6LUT-position cell: bits 32..63 when paired, all 64 solo.
+        //   5LUT-position cell: only ever bits 0..31 -- Vivado leaves
+        //   INIT[63:32] zero for a solo 5LUT (the O6 half is unused),
+        //   unlike a solo 6LUT cell which owns all 64 bits.
+        if (lut6 != null) {
             phys |= expandLutToPhys(lut6, paired ? 32 : 0, 64);
         }
-        if (lut5 != null && isLutType(lut5.getType())) {
-            // LUT5 alone: still loops 0..64; A6 is unused in its pin
-            // map so the iteration naturally fills the high 32 with the
-            // same bits as the low 32.
-            phys |= expandLutToPhys(lut5, 0, paired ? 32 : 64);
+        if (lut5 != null) {
+            phys |= expandLutToPhys(lut5, 0, 32);
         }
         StringBuilder sb = new StringBuilder(64);
         for (int i = 63; i >= 0; i--) sb.append(((phys >>> i) & 1L) == 1 ? '1' : '0');
@@ -442,6 +656,26 @@ public class dcp2fasm {
     // For LUT5 (lowHalfOnly=true), only bits 0..31 are populated and
     // returned; the upper 32 bits stay 0.
     static long expandLutToPhys(Cell lut, int lbound, int ubound) {
+        // Routethru (CARRY4 DI/S buffers, LUT-to-FF passthrough):
+        // RapidWright marks these with isRoutethru() and the *target*
+        // cell's type (CARRY4, FDRE, ...).  The bitstream is a buffer
+        // LUT through whichever physical input pin Vivado entered on
+        // (NOT always A6): INIT bit p = ((p >> pinIdx) & 1).
+        if (lut.isRoutethru() && !isLutType(lut.getType())) {
+            int pinIdx = -1;
+            for (String pp : lut.getPinMappingsP2L().keySet()) {
+                if (pp != null && pp.length() == 2 && pp.charAt(0) == 'A'
+                    && pp.charAt(1) >= '1' && pp.charAt(1) <= '6') {
+                    pinIdx = pp.charAt(1) - '1';
+                    break;
+                }
+            }
+            if (pinIdx < 0) pinIdx = 5;   // fallback: A6 buffer
+            long out = 0;
+            for (int p = lbound; p < ubound; p++)
+                if (((p >> pinIdx) & 1) == 1) out |= (1L << p);
+            return out;
+        }
         long logicalInit = parseInitHexToLong(lut.getProperty("INIT"));
         // Map: physical BEL-pin index (0..5) -> logical input index
         // (0..5).  E.g. for slot 'A', physical pin "A1" is index 0.
@@ -463,9 +697,14 @@ public class dcp2fasm {
             char d = pp.charAt(1);
             if (d < '1' || d > '6') continue;
             int physIdx = d - '1';              // A1->0, A6->5
-            if (!lp.startsWith("I")) continue;  // skip "O" output
+            // Logical input naming: I<n> for LUTs, RADR<n> for
+            // distributed-RAM cells (RAMD32/RAMS32/RAMD64E/RAMS64E).
+            String num = lp.startsWith("RADR") ? lp.substring(4)
+                       : lp.startsWith("I")    ? lp.substring(1)
+                       : null;
+            if (num == null) continue;          // skip "O"/"O5"/"O6" outputs
             try {
-                int logIdx = Integer.parseInt(lp.substring(1));
+                int logIdx = Integer.parseInt(num);
                 if (logIdx >= 0 && logIdx < 6) physToLog[physIdx] = logIdx;
             } catch (NumberFormatException ex) { /* skip */ }
         }
@@ -534,6 +773,399 @@ public class dcp2fasm {
         return bits.toString();
     }
 
+    // ===================================================================
+    // BRAM FASM emission -- ports nextpnr-xilinx fasm.cc write_bram_half /
+    // write_bram_width / write_bram_init.  RAMB36E1 occupies both
+    // RAMB18_Y0 and RAMB18_Y1 halves of the BRAM_L/R tile, with widths
+    // halved and the INIT bit lanes de-interleaved per half.
+    // ===================================================================
+    static int bramCount = 0;
+
+    static String hexPropToBits(Cell c, String name, int width) {
+        EDIFPropertyValue v = c.getEDIFCellInst().getProperty(name);
+        if (v == null) return null;
+        String sVal = v.getValue();
+        if (sVal == null) return null;
+        int apos = sVal.indexOf('\'');
+        String body = (apos >= 0) ? sVal.substring(apos + 2) : sVal;
+        body = body.replace("_", "").toLowerCase().trim();
+        int wantNibbles = (width + 3) / 4;
+        if (body.length() < wantNibbles)
+            body = repeat('0', wantNibbles - body.length()) + body;
+        else if (body.length() > wantNibbles)
+            body = body.substring(body.length() - wantNibbles);
+        StringBuilder bits = new StringBuilder();
+        for (char ch : body.toCharArray()) {
+            int n = Character.digit(ch, 16);
+            if (n < 0) n = 0;
+            for (int i = 3; i >= 0; i--) bits.append(((n >> i) & 1) == 1 ? '1' : '0');
+        }
+        if (bits.length() > width) bits.delete(0, bits.length() - width);
+        return bits.toString();   // MSB first: index (width-1-k) holds bit k
+    }
+
+    static double doubleProp(Cell c, String name, double def) {
+        EDIFPropertyValue v = c.getEDIFCellInst().getProperty(name);
+        if (v == null) return def;
+        try { return Double.parseDouble(v.getValue().trim()); }
+        catch (Exception e) { return def; }
+    }
+
+    // MMCM lock/filter lookup tables, extracted from nextpnr fasm.cc
+    // write_mmcm() (the HW-validated version: TABLE=filter[mult-1],
+    // FILTREG1=0x8, POWER_REG=0x100).  Index = CLKFBOUT_MULT_F - 1.
+    static final long[] MMCM_LKTABLE = {
+        0x31BE8FA401L, 0x31BE8FA401L, 0x423E8FA401L, 0x5AFE8FA401L,
+        0x73BE8FA401L, 0x8C7E8FA401L, 0x9CFE8FA401L, 0xB5BE8FA401L,
+        0xCE7E8FA401L, 0xE73E8FA401L, 0xFFF84FA401L, 0xFFF39FA401L,
+        0xFFEEEFA401L, 0xFFEBCFA401L, 0xFFE8AFA401L, 0xFFE71FA401L,
+        0xFFE3FFA401L, 0xFFE26FA401L, 0xFFE0DFA401L, 0xFFDF4FA401L,
+        0xFFDDBFA401L, 0xFFDC2FA401L, 0xFFDA9FA401L, 0xFFD90FA401L,
+        0xFFD90FA401L, 0xFFD77FA401L, 0xFFD5EFA401L, 0xFFD5EFA401L,
+        0xFFD45FA401L, 0xFFD45FA401L, 0xFFD2CFA401L, 0xFFD2CFA401L,
+        0xFFD2CFA401L, 0xFFD13FA401L, 0xFFD13FA401L, 0xFFD13FA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+        0xFFCFAFA401L, 0xFFCFAFA401L, 0xFFCFAFA401L,
+    };
+    static final int[] MMCM_FILT_LOW = {
+        0x0BC, 0x0BC, 0x0BC, 0x0BC, 0x09C, 0x0AC, 0x0B4, 0x08C,
+        0x094, 0x094, 0x0A4, 0x0B8, 0x0B8, 0x0B8, 0x0B8, 0x084,
+        0x084, 0x084, 0x098, 0x098, 0x098, 0x098, 0x098, 0x098,
+        0x098, 0x0A8, 0x0A8, 0x0A8, 0x0A8, 0x0A8, 0x0B0, 0x0B0,
+        0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0,
+        0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x0B0, 0x088,
+        0x088, 0x088, 0x088, 0x088, 0x088, 0x088, 0x088, 0x088,
+        0x088, 0x088, 0x088, 0x088, 0x088, 0x088, 0x088, 0x088,
+    };
+    static final int[] MMCM_FILT_LOW_SS = {
+        0x0BF, 0x0BF, 0x0BF, 0x0BF, 0x09F, 0x0AF, 0x0B7, 0x08F,
+        0x097, 0x097, 0x0A7, 0x0BB, 0x0BB, 0x0BB, 0x0BB, 0x087,
+        0x087, 0x087, 0x09B, 0x09B, 0x09B, 0x09B, 0x09B, 0x09B,
+        0x09B, 0x0AB, 0x0AB, 0x0AB, 0x0AB, 0x0AB, 0x0B3, 0x0B3,
+        0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3,
+        0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x0B3, 0x08B,
+        0x08B, 0x08B, 0x08B, 0x08B, 0x08B, 0x08B, 0x08B, 0x08B,
+        0x08B, 0x08B, 0x08B, 0x08B, 0x08B, 0x08B, 0x08B, 0x08B,
+    };
+    static final int[] MMCM_FILT_HIGH = {
+        0x0BC, 0x13C, 0x16C, 0x1DC, 0x35C, 0x3AC, 0x3B4, 0x3CC,
+        0x394, 0x3D4, 0x3E4, 0x344, 0x3E4, 0x3E4, 0x3E4, 0x3E4,
+        0x3D4, 0x3D4, 0x304, 0x304, 0x304, 0x170, 0x170, 0x170,
+        0x170, 0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0,
+        0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0, 0x0D0,
+        0x0D0, 0x0A0, 0x0A0, 0x0A0, 0x0A0, 0x0A0, 0x1C4, 0x1C4,
+        0x130, 0x130, 0x130, 0x130, 0x184, 0x184, 0x158, 0x158,
+        0x158, 0x090, 0x090, 0x090, 0x090, 0x128, 0x0F0, 0x0F0,
+    };
+    static final int[] MMCM_FILT_OPTIMIZED = MMCM_FILT_HIGH;
+
+    static void mmcmVec(List<String> lines, String prefix, String name,
+                        long value, int width) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = width - 1; i >= 0; i--)
+            sb.append(((value >>> i) & 1L) == 1L ? '1' : '0');
+        lines.add(prefix + name + "[" + (width - 1) + ":0] = "
+                  + width + "'b" + sb);
+    }
+
+    // One MMCM output counter (DIVCLK / CLKFBOUT / CLKOUT0-6) -- ported
+    // from fasm.cc write_mmcm_clkout (HW-validated encoder).
+    static void emitMmcmClkout(List<String> lines, String prefix, Cell c,
+                               String name) {
+        int high = 1, low = 1, phasemux = 0, delaytime = 0, frac = 0;
+        boolean noCount = false, edge = false;
+        String divProp = name + (name.equals("CLKFBOUT") ? "_MULT_F"
+                       : name.equals("CLKOUT0") ? "_DIVIDE_F" : "_DIVIDE");
+        double divide = doubleProp(c, divProp, 1);
+        double phase = doubleProp(c, name + "_PHASE", 0);
+        if (divide <= 1) {
+            noCount = true;
+        } else {
+            high = (int)Math.floor(divide / 2);
+            low = (int)(Math.floor(divide) - high);
+            if (high != low) edge = true;
+            if (name.equals("CLKOUT0") || name.equals("CLKFBOUT"))
+                frac = (int)(Math.floor(divide * 8) - Math.floor(divide) * 8);
+            int phaseEights = (int)Math.floor((phase / 360) * divide * 8);
+            phasemux = ((phaseEights % 8) + 8) % 8;
+            delaytime = phaseEights / 8;
+        }
+        boolean used = name.equals("DIVCLK") || name.equals("CLKFBOUT");
+        if (!used) {
+            com.xilinx.rapidwright.edif.EDIFCellInst inst = c.getEDIFCellInst();
+            com.xilinx.rapidwright.edif.EDIFPortInst pi =
+                inst == null ? null : inst.getPortInst(name);
+            used = pi != null && pi.getNet() != null;
+        }
+        if (name.equals("DIVCLK")) {
+            mmcmVec(lines, prefix, "DIVCLK_DIVCLK_HIGH_TIME", high, 6);
+            mmcmVec(lines, prefix, "DIVCLK_DIVCLK_LOW_TIME", low, 6);
+            if (edge) lines.add(prefix + "DIVCLK_DIVCLK_EDGE[0]");
+            if (noCount) lines.add(prefix + "DIVCLK_DIVCLK_NO_COUNT[0]");
+        } else if (used) {
+            boolean is56 = name.equals("CLKOUT5") || name.equals("CLKOUT6");
+            boolean isC0 = name.equals("CLKOUT0");
+            boolean isFb = name.equals("CLKFBOUT");
+            if ((isC0 || isFb) && frac != 0) {
+                --high; --low;
+                int fracShifted = frac >> 1;
+                String fcn = isC0 ? "CLKOUT5_CLKOUT2_" : "CLKOUT6_CLKOUT2_";
+                if (fracShifted >= 1) {
+                    lines.add(prefix + fcn + "FRACTIONAL_FRAC_WF_F[0]");
+                    mmcmVec(lines, prefix, fcn + "FRACTIONAL_PHASE_MUX_F", fracShifted, 2);
+                }
+            }
+            lines.add(prefix + name + "_CLKOUT1_OUTPUT_ENABLE[0]");
+            mmcmVec(lines, prefix, name + "_CLKOUT1_HIGH_TIME", high, 6);
+            mmcmVec(lines, prefix, name + "_CLKOUT1_LOW_TIME", low, 6);
+            mmcmVec(lines, prefix, name + "_CLKOUT1_PHASE_MUX", phasemux, 3);
+            if (edge) lines.add(prefix + name +
+                (is56 ? "_CLKOUT2_FRACTIONAL_EDGE[0]" : "_CLKOUT2_EDGE[0]"));
+            if (noCount) lines.add(prefix + name +
+                (is56 ? "_CLKOUT2_FRACTIONAL_NO_COUNT[0]" : "_CLKOUT2_NO_COUNT[0]"));
+            mmcmVec(lines, prefix, name +
+                (is56 ? "_CLKOUT2_FRACTIONAL_DELAY_TIME" : "_CLKOUT2_DELAY_TIME"),
+                delaytime, 6);
+            if (!is56 && frac != 0) {
+                lines.add(prefix + name + "_CLKOUT2_FRAC_EN[0]");
+                lines.add(prefix + name + "_CLKOUT2_FRAC_WF_R[0]");
+                mmcmVec(lines, prefix, name + "_CLKOUT2_FRAC", frac, 3);
+            }
+        } else {
+            // Unused counter: Vivado programs divide-by-1 with NO_COUNT
+            // (HIGH_TIME=1, LOW_TIME=1); all-zero registers never match
+            // golden bitstreams.
+            boolean is56 = name.equals("CLKOUT5") || name.equals("CLKOUT6");
+            mmcmVec(lines, prefix, name + "_CLKOUT1_HIGH_TIME", 1, 6);
+            mmcmVec(lines, prefix, name + "_CLKOUT1_LOW_TIME", 1, 6);
+            lines.add(prefix + name +
+                (is56 ? "_CLKOUT2_FRACTIONAL_NO_COUNT[0]" : "_CLKOUT2_NO_COUNT[0]"));
+        }
+    }
+
+    static void emitMmcm(SiteInst si, Map<String,List<String>> byTile) {
+        Cell c = null;
+        for (Cell sc : si.getCells()) {
+            String t = sc.getType();
+            if (t != null && t.startsWith("MMCME2")) { c = sc; break; }
+        }
+        if (c == null) { bump("MMCM:no-cell"); return; }
+        String tn = si.getTile().getName();
+        String prefix = tn + ".MMCME2_ADV.";
+        List<String> lines = new ArrayList<>();
+        lines.add(prefix + "IN_USE");
+        // ZINV on the static control pins: golden sets them when the pin
+        // is constant-tied (not logic-driven) and not param-inverted;
+        // a logic-driven pin (e.g. a real RST) leaves the bit clear.
+        for (String p : new String[]{"PWRDWN","RST","PSEN","PSINCDEC"}) {
+            if (!cellPinDrivenByLogic(c, p)
+                && !getBoolParam(c, "IS_" + p + "_INVERTED"))
+                lines.add(prefix + "ZINV_" + p);
+        }
+        if (getBoolParam(c, "IS_CLKINSEL_INVERTED"))
+            lines.add(prefix + "INV_CLKINSEL");
+        for (String n : new String[]{"DIVCLK","CLKFBOUT","CLKOUT0","CLKOUT1",
+                                     "CLKOUT2","CLKOUT3","CLKOUT4","CLKOUT5","CLKOUT6"})
+            emitMmcmClkout(lines, prefix, c, n);
+        String comp = strProp(c, "COMPENSATION", "INTERNAL");
+        if (comp.equals("INTERNAL") || comp.equals("ZHOLD"))
+            lines.add(prefix + "COMP.Z_ZHOLD");
+        else
+            System.err.println("[dcp2fasm] WARNING: unsupported MMCM COMPENSATION " + comp);
+        int mult = (int)doubleProp(c, "CLKFBOUT_MULT_F", 5.0);
+        if (mult < 1) mult = 1;
+        if (mult > 63) mult = 63;
+        mmcmVec(lines, prefix, "LKTABLE", MMCM_LKTABLE[mult - 1], 40);
+        String bw = strProp(c, "BANDWIDTH", "OPTIMIZED");
+        int[] filt = bw.equals("LOW") ? MMCM_FILT_LOW
+                   : bw.equals("LOW_SS") ? MMCM_FILT_LOW_SS
+                   : bw.equals("HIGH") ? MMCM_FILT_HIGH
+                   : MMCM_FILT_OPTIMIZED;
+        mmcmVec(lines, prefix, "FILTREG1_RESERVED", 0x8, 12);
+        mmcmVec(lines, prefix, "POWER_REG_POWER_REG_POWER_REG", 0x100, 16);
+        lines.add(prefix + "LOCKREG3_RESERVED[0]");
+        mmcmVec(lines, prefix, "TABLE", filt[mult - 1], 10);
+        for (String l : lines) addLine(byTile, tn, l);
+        bumpClock();
+    }
+
+    static long mmcmCount = 0;
+    static void bumpClock() { mmcmCount++; }
+
+    static int intProp(Cell c, String name, int def) {
+        EDIFPropertyValue v = c.getEDIFCellInst().getProperty(name);
+        if (v == null) return def;
+        try {
+            String sVal = v.getValue().trim();
+            int apos = sVal.indexOf('\'');
+            if (apos >= 0) sVal = sVal.substring(apos + 2);   // "18'd36"
+            return Integer.parseInt(sVal);
+        } catch (Exception e) { return def; }
+    }
+
+    static void bramWidth(List<String> lines, String prefix, Cell c,
+                          String name, boolean is36, boolean isY1) {
+        int width = intProp(c, name, 0);
+        if (width == 0) width = 1;   // golden encodes unused ports as width 1
+        int actual = width;
+        if (is36) actual = (width == 1) ? 1 : width / 2;
+        if (((is36 && width == 72) || (isY1 && actual == 36)) && name.equals("READ_WIDTH_A"))
+            lines.add(prefix + name + "_18");
+        if (actual == 36) {
+            lines.add(prefix + "SDP_" + name.substring(0, name.length() - 2) + "_36");
+            if (name.startsWith("WRITE")) {
+                lines.add(prefix + name.substring(0, name.length() - 1) + "A_18");
+                lines.add(prefix + name.substring(0, name.length() - 1) + "B_18");
+            } else {
+                lines.add(prefix + name.substring(0, name.length() - 1) + "B_18");
+            }
+        } else {
+            lines.add(prefix + name + "_" + actual);
+        }
+    }
+
+    static void emitBram(SiteInst si, Map<String,List<String>> byTile) {
+        String stype = si.getSiteTypeEnum().name();
+        Cell cell = null;
+        for (Cell c : si.getCells()) {
+            String t = c.getType();
+            if (t != null && t.startsWith("RAMB")) { cell = c; break; }
+        }
+        if (cell == null) { bump("BRAM:no-cell:" + stype); return; }
+        String tn = si.getTile().getName();
+        boolean is36 = cell.getType().startsWith("RAMB36");
+        int[] halves;
+        if (is36) {
+            halves = new int[]{0, 1};
+        } else {
+            int sy = Integer.parseInt(si.getSiteName().replaceAll(".*Y", ""));
+            halves = new int[]{ sy % 2 };
+        }
+        boolean[] pinUsed = new boolean[10];
+        String[] zinvPins = {"CLKARDCLK","CLKBWRCLK","ENARDEN","ENBWREN",
+                             "REGCLKARDRCLK","REGCLKB","RSTRAMARSTRAM",
+                             "RSTRAMB","RSTREGARSTREG","RSTREGB"};
+        for (int pi = 0; pi < zinvPins.length; pi++) {
+            // golden programs ZINV on pins with logical connections; the
+            // EN pins additionally get it when tied to constant VCC
+            // (always-enabled RAM), and the REGCLK/RSTREG pins only when
+            // the corresponding output register actually exists.
+            String p = zinvPins[pi];
+            pinUsed[pi] = cellPinDrivenByLogic(cell, p);
+            if (p.startsWith("EN"))
+                pinUsed[pi] |= cellPinTiedToVcc(cell, p);
+            if (p.equals("RSTREGARSTREG") || p.equals("REGCLKARDRCLK"))
+                pinUsed[pi] &= intProp(cell, "DOA_REG", 0) != 0;
+            if (p.equals("RSTREGB") || p.equals("REGCLKB"))
+                pinUsed[pi] &= intProp(cell, "DOB_REG", 0) != 0;
+        }
+        for (int half : halves) {
+            String prefix = tn + ".RAMB18_Y" + half + ".";
+            List<String> lines = new ArrayList<>();
+            lines.add(prefix + "IN_USE");
+            bramWidth(lines, prefix, cell, "READ_WIDTH_A", is36, half == 1);
+            bramWidth(lines, prefix, cell, "READ_WIDTH_B", is36, half == 1);
+            bramWidth(lines, prefix, cell, "WRITE_WIDTH_A", is36, half == 1);
+            bramWidth(lines, prefix, cell, "WRITE_WIDTH_B", is36, half == 1);
+            if (intProp(cell, "DOA_REG", 0) != 0) lines.add(prefix + "DOA_REG");
+            if (intProp(cell, "DOB_REG", 0) != 0) lines.add(prefix + "DOB_REG");
+            for (int pi = 0; pi < zinvPins.length; pi++) {
+                if (pinUsed[pi] && !getBoolParam(cell, "IS_" + zinvPins[pi] + "_INVERTED"))
+                    lines.add(prefix + "ZINV_" + zinvPins[pi]);
+            }
+            for (String wm : new String[]{"WRITE_MODE_A", "WRITE_MODE_B"}) {
+                String mode = strProp(cell, wm, "WRITE_FIRST");
+                if (!mode.equals("WRITE_FIRST"))
+                    lines.add(prefix + wm + "_" + mode);
+            }
+            // golden defaults
+            String rdc = strProp(cell, "RDADDR_COLLISION_HWCONFIG", "DELAYED_WRITE");
+            if (rdc.equals("PERFORMANCE"))
+                lines.add(prefix + "RDADDR_COLLISION_HWCONFIG_PERFORMANCE");
+            for (String ab : new String[]{"A","B"}) {
+                String rp = strProp(cell, "RSTREG_PRIORITY_" + ab, "RSTREG");
+                lines.add(prefix + "RSTREG_PRIORITY_" + ab + "_" + rp);
+            }
+            // nextpnr emits all-ones ZINIT/ZSRVAL (INIT_A/B = SRVAL_A/B = 0
+            // assumed); warn if the design says otherwise.
+            for (String z : new String[]{"INIT_A","INIT_B","SRVAL_A","SRVAL_B"}) {
+                String bits = hexPropToBits(cell, z, 36);
+                if (bits != null && bits.indexOf('1') >= 0)
+                    System.err.println("[dcp2fasm] WARNING: nonzero " + z +
+                        " on " + cell.getName() + " not encoded");
+            }
+            lines.add(prefix + "ZINIT_A[17:0] = 18'b" + repeat('1', 18));
+            lines.add(prefix + "ZINIT_B[17:0] = 18'b" + repeat('1', 18));
+            lines.add(prefix + "ZSRVAL_A[17:0] = 18'b" + repeat('1', 18));
+            lines.add(prefix + "ZSRVAL_B[17:0] = 18'b" + repeat('1', 18));
+            // INIT content (de-interleaved for RAMB36)
+            for (String mode : new String[]{"", "P"}) {
+                int n = mode.equals("P") ? 8 : 64;
+                for (int i = 0; i < n; i++) {
+                    char[] init = new char[256];
+                    Arrays.fill(init, '0');
+                    boolean has = false;
+                    if (is36) {
+                        for (int j = 0; j < 2; j++) {
+                            String bs = hexPropToBits(cell,
+                                String.format("INIT%s_%02X", mode, i * 2 + j), 256);
+                            if (bs == null) continue;
+                            has = true;
+                            for (int k = half; k < 256; k += 2) {
+                                if (bs.charAt(255 - k) == '1')
+                                    init[255 - (j * 128 + (k / 2))] = '1';
+                            }
+                        }
+                    } else {
+                        String bs = hexPropToBits(cell,
+                            String.format("INIT%s_%02X", mode, i), 256);
+                        if (bs != null) { has = true; init = bs.toCharArray(); }
+                    }
+                    if (has)
+                        lines.add(prefix + String.format("INIT%s_%02X[255:0] = 256'b", mode, i)
+                                  + new String(init));
+                }
+            }
+            for (String l : lines) addLine(byTile, tn, l);
+        }
+        // RAMB36-level aggregate features (tile namespace "RAMB36").
+        // Vivado writes the port-A width-1 defaults on EVERY used BRAM
+        // tile (RAMB18 pairs included); the B forms only for a genuine
+        // width-1 port B (never for an unused width-0 port).
+        // BRAM36_*_WIDTH_*_1 are REAL bits; golden/Vivado set them ONLY for a
+        // genuine RAMB36E1 with a width-1 port -- NOT on width-1 RAMB18 pairs
+        // and NOT on width-18 RAMB36.  Emitting them unconditionally (the old
+        // behaviour, == the nextpnr fasm.cc bug) corrupts every RAMB.
+        for (String rw : new String[]{"READ_WIDTH_A","WRITE_WIDTH_A",
+                                      "READ_WIDTH_B","WRITE_WIDTH_B"}) {
+            if (is36 && intProp(cell, rw, 0) == 1)
+                addLine(byTile, tn, tn + ".RAMB36.BRAM36_" + rw + "_1");
+        }
+        if (is36) {
+            for (String ab : new String[]{"A","B"}) {
+                String ext = strProp(cell, "RAM_EXTENSION_" + ab, "NONE");
+                addLine(byTile, tn, tn + ".RAMB36.RAM_EXTENSION_" + ab +
+                        (ext.equals("LOWER") ? "_LOWER" : "_NONE_OR_UPPER"));
+            }
+        }
+        // FIFO almost-empty/full offsets: complement encoding, all-ones for
+        // the BRAM (non-FIFO) default of 0.
+        addLine(byTile, tn, tn + ".ZALMOST_EMPTY_OFFSET[12:0] = 13'b" + repeat('1', 13));
+        addLine(byTile, tn, tn + ".ZALMOST_FULL_OFFSET[12:0] = 13'b" + repeat('1', 13));
+        bramCount++;
+    }
+
+    static String strProp(Cell c, String name, String def) {
+        EDIFPropertyValue v = c.getEDIFCellInst().getProperty(name);
+        if (v == null || v.getValue() == null) return def;
+        return v.getValue().trim().replace("\"", "");
+    }
+
     static String repeat(char c, int n) {
         char[] a = new char[n];
         Arrays.fill(a, c);
@@ -561,44 +1193,59 @@ public class dcp2fasm {
                 try (BufferedReader br = new BufferedReader(
                         new InputStreamReader(zf.getInputStream(ze)))) {
                     String line;
-                    while ((line = br.readLine()) != null) {
-                        line = line.trim();
-                        if (!line.startsWith("set_property ")) continue;
-                        // Parse: set_property PROP VALUE [get_ports {NAME}]
-                        String rest = line.substring("set_property ".length()).trim();
-                        int sp1 = rest.indexOf(' ');
-                        if (sp1 < 0) continue;
-                        String prop = rest.substring(0, sp1);
-                        rest = rest.substring(sp1 + 1).trim();
-                        int sp2 = rest.indexOf(' ');
-                        if (sp2 < 0) continue;
-                        String val = rest.substring(0, sp2);
-                        rest = rest.substring(sp2 + 1).trim();
-                        // rest now starts with "[get_ports ...]"
-                        if (!rest.startsWith("[get_ports")) continue;
-                        int braceL = rest.indexOf('{');
-                        int braceR = rest.lastIndexOf('}');
-                        String port;
-                        if (braceL >= 0 && braceR > braceL) {
-                            port = rest.substring(braceL + 1, braceR).trim();
-                        } else {
-                            // No braces: token between "get_ports " and "]"
-                            int start = rest.indexOf("get_ports") + "get_ports".length();
-                            int end = rest.lastIndexOf(']');
-                            if (end < 0) continue;
-                            port = rest.substring(start, end).trim();
-                        }
-                        if (prop.equals("IOSTANDARD") || prop.equals("SLEW")
-                            || prop.equals("DRIVE") || prop.equals("PULLTYPE")
-                            || prop.equals("IN_TERM")) {
-                            xdcByPort.computeIfAbsent(port, k -> new HashMap<>())
-                                     .put(prop, val);
-                        }
-                    }
+                    while ((line = br.readLine()) != null) harvestXdcLine(line);
                 }
             }
         } catch (Exception ex) {
             System.err.println("[dcp2fasm] WARNING: failed to read XDC from DCP: " + ex);
+        }
+    }
+
+    // Harvest IOSTANDARD/SLEW/DRIVE/PULLTYPE/IN_TERM from the Design's own
+    // constraint list.  RapidWright populates getXDCConstraints() from the
+    // bundled top.xdc when reading a DCP, and xml2dcp populates it from the
+    // opendcp <constraints> block -- so this single path covers BOTH the DCP
+    // and the XML->FASM (xml2fasm) flows.  Without it the xml2fasm path has no
+    // bundled DCP to read and every IOB silently defaults to LVCMOS33.
+    static void parseDesignXdc(Design des) {
+        for (com.xilinx.rapidwright.design.ConstraintGroup g
+                 : com.xilinx.rapidwright.design.ConstraintGroup.values()) {
+            List<String> xs = des.getXDCConstraints(g);
+            if (xs != null) for (String line : xs) harvestXdcLine(line);
+        }
+    }
+
+    // Parse one "set_property PROP VALUE [get_ports {NAME}]" line into xdcByPort.
+    // Brace-balanced so port names with brackets (like "led[2]") survive intact.
+    static void harvestXdcLine(String line) {
+        if (line == null) return;
+        line = line.trim();
+        if (!line.startsWith("set_property ")) return;
+        String rest = line.substring("set_property ".length()).trim();
+        int sp1 = rest.indexOf(' ');
+        if (sp1 < 0) return;
+        String prop = rest.substring(0, sp1);
+        rest = rest.substring(sp1 + 1).trim();
+        int sp2 = rest.indexOf(' ');
+        if (sp2 < 0) return;
+        String val = rest.substring(0, sp2);
+        rest = rest.substring(sp2 + 1).trim();
+        if (!rest.startsWith("[get_ports")) return;
+        int braceL = rest.indexOf('{');
+        int braceR = rest.lastIndexOf('}');
+        String port;
+        if (braceL >= 0 && braceR > braceL) {
+            port = rest.substring(braceL + 1, braceR).trim();
+        } else {
+            int start = rest.indexOf("get_ports") + "get_ports".length();
+            int end = rest.lastIndexOf(']');
+            if (end < 0) return;
+            port = rest.substring(start, end).trim();
+        }
+        if (prop.equals("IOSTANDARD") || prop.equals("SLEW")
+            || prop.equals("DRIVE") || prop.equals("PULLTYPE")
+            || prop.equals("IN_TERM")) {
+            xdcByPort.computeIfAbsent(port, k -> new HashMap<>()).put(prop, val);
         }
     }
 
@@ -1132,6 +1779,61 @@ public class dcp2fasm {
     // inward through the X axis.  Emit IOB_COL_BANK_ACTIVE and
     // IOB_COL_OBUF_CASCADE_Y1 on that INT tile.
     // ===================================================================
+    // Propagate CLK_HROW CK_GCLK<n>_ACTIVE to every clock-region row that
+    // CONSUMES the global clock, not just the row that drives it.  dcp2fasm's
+    // PIP-based emission already sets the DRIVING row (where the GCLK<n> ->
+    // CK_MUX_OUT pip lives).  golden also marks pure-CONSUMER rows -- a pip-less
+    // HROW tile whose clock region holds fabric loads of the net.  Without them
+    // the GCLK spine never enables in that region and the fabric there stays
+    // frozen.  Map: net -> GCLK<n> (from its routing) -> load clock-region rows
+    // -> the CLK_HROW_BOT_R tile at that row (Y-sorted index).
+    static final Pattern GCLK_WIRE = Pattern.compile("CLK_HROW_R_CK_GCLK(\\d+)");
+    static void emitGclkActive(Design des, Map<String,List<String>> byTile) {
+        com.xilinx.rapidwright.device.Device dev = des.getDevice();
+        // CLK_HROW_BOT_R tiles indexed by clock-region row (ascending Y).
+        TreeMap<Integer,String> byY = new TreeMap<>();
+        for (Tile t : dev.getAllTiles())
+            if (t.getName().startsWith("CLK_HROW_BOT_R"))
+                byY.put(t.getTileYCoordinate(), t.getName());
+        List<String> H = new ArrayList<>(byY.values());     // index == region row
+        Integer[] HY = byY.keySet().toArray(new Integer[0]); // HROW tile Y per row
+        if (H.isEmpty()) return;
+        for (Net n : des.getNets()) {
+            int g = -1;
+            for (PIP p : n.getPIPs()) {
+                Matcher m = GCLK_WIRE.matcher(p.getStartWireName());
+                if (!m.matches()) m = GCLK_WIRE.matcher(p.getEndWireName());
+                if (m.matches()) { g = Integer.parseInt(m.group(1)); break; }
+            }
+            if (g < 0) continue;
+            // The GCLK spine is active across every clock-region row it spans --
+            // from the DRIVER (BUFG) row down through the lowest LOAD row.  Loads
+            // sit in normal fabric (getClockRegion gives their row); the BUFG
+            // source is in the centre column (no clock region) so map its tile-Y
+            // to the nearest HROW row.
+            int lo = Integer.MAX_VALUE, hi = Integer.MIN_VALUE;
+            for (SitePinInst spi : n.getPins()) {
+                Tile lt = spi.getTile();
+                if (lt == null) continue;
+                int row;
+                com.xilinx.rapidwright.device.ClockRegion cr = lt.getClockRegion();
+                if (cr != null) {
+                    row = cr.getInstanceY();
+                } else if (spi.isOutPin()) {
+                    int y = lt.getTileYCoordinate(), best = 0;
+                    for (int i = 1; i < HY.length; i++)
+                        if (Math.abs(HY[i] - y) < Math.abs(HY[best] - y)) best = i;
+                    row = best;
+                } else continue;
+                if (row < lo) lo = row;
+                if (row > hi) hi = row;
+            }
+            for (int r = lo; r <= hi; r++)
+                if (r >= 0 && r < H.size())
+                    addLine(byTile, H.get(r), H.get(r) + ".CLK_HROW_R_CK_GCLK" + g + "_ACTIVE");
+        }
+    }
+
     static void emitIobColBankActive(Design des, Map<String,List<String>> byTile) {
         if (obufTiles.isEmpty()) return;
         com.xilinx.rapidwright.device.Device dev = des.getDevice();
@@ -1146,7 +1848,10 @@ public class dcp2fasm {
             int gx = io.getColumn();
             int chipW = dev.getColumns();
             String chosen = null;
-            for (int dy = 0; dy <= 2 && chosen == null; dy++) {
+            // dy=0 only: the ±2-row fallback emitted on INT_L_X32Y127
+            // (from an OBUF whose own row lacks an INT tile) where the
+            // golden bitstream has no IOB_COL bits -- 6 stray bits.
+            for (int dy = 0; dy <= 0 && chosen == null; dy++) {
                 for (int sgn = 1; sgn >= -1; sgn -= 2) {
                     if (dy == 0 && sgn == -1) continue;
                     int yScan = gy + sgn * dy;
@@ -1439,6 +2144,39 @@ public class dcp2fasm {
             catch (NumberFormatException e) { /* skip */ }
         }
 
+        // CLK_BUFG_REBUF GCLK enables: Vivado sets them per SEGMENT
+        // occupancy of each routed clock.  A REBUF tile's _TOP wire
+        // belongs to the spine segment above the tile and _BOT to the
+        // segment below; walking every routed node's wires gives the
+        // exact set (golden rule: wire <n>_TOP used -> GCLK<n>_ENABLE_
+        // BELOW, <n>_BOT used -> GCLK<n>_ENABLE_ABOVE; through-tiles
+        // naturally get both).
+        {
+            java.util.Set<String> rebufFeats = new java.util.TreeSet<>();
+            java.util.regex.Pattern rp = java.util.regex.Pattern.compile(
+                "CLK_BUFG_REBUF_R_CK_(GCLK\\d+)_(TOP|BOT)");
+            for (com.xilinx.rapidwright.design.Net net : des.getNets()) {
+                for (PIP pip : net.getPIPs()) {
+                    for (com.xilinx.rapidwright.device.Node node :
+                             new com.xilinx.rapidwright.device.Node[]{
+                                 pip.getStartNode(), pip.getEndNode()}) {
+                        if (node == null) continue;
+                        for (com.xilinx.rapidwright.device.Wire w : node.getAllWiresInNode()) {
+                            Tile wt = w.getTile();
+                            if (wt == null || !wt.getTileTypeEnum().name().equals("CLK_BUFG_REBUF"))
+                                continue;
+                            java.util.regex.Matcher wm = rp.matcher(w.getWireName());
+                            if (!wm.matches()) continue;
+                            rebufFeats.add(wt.getName() + "." + wm.group(1) + "_ENABLE_"
+                                + (wm.group(2).equals("TOP") ? "BELOW" : "ABOVE"));
+                        }
+                    }
+                }
+            }
+            for (String f : rebufFeats)
+                addLine(byTile, f.substring(0, f.indexOf('.')), f);
+        }
+
         // Per-tile-type defaults emitted regardless of bare PIPs.
         // fasm.cc:1601-1638 second per-tile loop.
         // Default allGclk to GCLK16/GCLK30 if the first-pass walk didn't
@@ -1451,14 +2189,7 @@ public class dcp2fasm {
             String ttype = t.getTileTypeEnum().name();
             int row = t.getRow();
             if (ttype.equals("CLK_BUFG_REBUF")) {
-                // Emit for every REBUF tile in an active BUFG-clock
-                // column.  Use the per-design allGclk set (fasm.cc:1605).
-                if (!bufgClkColX.contains(t.getTileXCoordinate())) continue;
-                for (String gclk : gclkSet) {
-                    addLine(byTile, tn, tn + "." + gclk + "_ENABLE_ABOVE");
-                    addLine(byTile, tn, tn + "." + gclk + "_ENABLE_BELOW");
-                }
-                continue;
+                continue;   // handled by the segment-occupancy pass above
             }
             if (ttype.startsWith("HCLK_CMT")) {
                 // fasm.cc:1609-1612 -- HCLK_CMT_CK_<BUFHCLK*>_USED for

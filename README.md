@@ -56,9 +56,17 @@ RapidWright release jar from
 ## Layout
 
     json_drc-portable/
+      Makefile                               — fetch, build, verify, dist
       run.sh                                 — launcher
       lib/
-        rapidwright_json_drc.jar             — the DRC tool (+ json2dcp)
+        rapidwright_json_drc.jar             — the DRC tool
+        rapidwright_json2dcp.jar             — routed JSON -> DCP
+        rapidwright_dcp2fasm.jar             — DCP -> FASM
+        rapidwright_dcp2xml.jar              — DCP -> opendcp XML
+        rapidwright_xml2dcp.jar              — opendcp XML -> DCP
+        rapidwright_xml2json.jar             — opendcp XML -> nextpnr JSON
+        rapidwright_xml2fasm.jar             — opendcp XML -> FASM
+        rapidwright_dcp2routes.jar           — DCP -> per-net routes
         rapidwright-2025.2.1-standalone-lin64.jar
         gson-2.10.1.jar
       data/
@@ -70,17 +78,30 @@ RapidWright release jar from
       oracle/
         xc7vx485tffg1761-2.oracle.txt.gz      — V7 wire-name oracle
       src/                                    — source in preferred form
-        json_drc.java, json2dcp.java, dcp2fasm.java, WireOracle.java,
-        BuildWireOracle.java, DumpTileWires.java, list_iob_bels.java,
-        manifest.mf, build.sh, package_json_drc.sh, SOURCES.md
+        the ten .java files above, one manifest per tool, SOURCES.md
+        attic/                                — not compiled; see its README
+
+## The opendcp XML round trip
+
+`dcp2xml` writes a checkpoint out as readable XML plus an EDIF sidecar;
+`xml2dcp` reads that pair back into a DCP:
+
+    dcp2xml  in.dcp   out.xml        # also writes out.edif
+    xml2dcp  out.xml  rebuilt.dcp    # sidecar found by name
+
+Running it on a checkpoint Vivado itself produced is the control that
+separates a defect in a *design* from a defect in the *DCP writer* — if
+the rebuilt copy of a known-good checkpoint fails a check the original
+passes, the writer lost something.  `dcp2xml`'s summary line reports
+`routethru=`, which is also the tell for provenance: Vivado's own place
+and route emits route-throughs, RapidWright-written DCPs have none.
 
 ## Source / rebuild
 
-Every `.java` file we authored, plus the build glue, is included in
-`src/` in the preferred form for modification.  See `src/SOURCES.md`
-for the in-place rebuild recipe (no extra downloads — the bundle's
-`lib/` already has every jar `javac` needs) and pointers to the
-upstream sources for RapidWright, gson, and the device data.
+Every `.java` file we authored is in `src/` in the preferred form for
+modification; `make jars` rebuilds them.  See `src/SOURCES.md` for the
+tool-by-tool breakdown and pointers to the upstream sources for
+RapidWright, gson, and the device data.
 
 ## Adding more parts
 

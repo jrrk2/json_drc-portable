@@ -1,30 +1,47 @@
 # Source — preferred form for modification
 
-The `.java` files and the two shell scripts in this directory are the
-preferred form for modification of every component of this tool that
-we authored.  Together they reproduce the bundle byte-for-byte (modulo
-the timestamps embedded in the tar header).
+The `.java` files in this directory are the preferred form for
+modification of every component of this tool that we authored.
 
-## Rebuild from inside the bundle
+## The tools
 
-The bundle's `lib/` already contains all the jars that `javac` needs:
+| Jar entry point | What it does |
+|---|---|
+| `json_drc`   | Vivado-free physical DRC over a DCP or a nextpnr routed JSON |
+| `json2dcp`   | nextpnr routed JSON -> Vivado DCP (the import path) |
+| `dcp2fasm`   | DCP -> FASM, for prjxray bitgen without Vivado |
+| `dcp2xml`    | DCP -> "opendcp" XML, the readable interchange dump |
+| `xml2dcp`    | opendcp XML -> DCP, closing the round trip |
+| `xml2json`   | opendcp XML -> nextpnr JSON |
+| `xml2fasm`   | opendcp XML -> FASM |
+| `dcp2routes` | DCP -> per-net route listing |
 
-    cd src
-    javac -d ../lib/classes \
-          -cp ../lib/rapidwright-2025.2.1-standalone-lin64.jar:../lib/gson-2.10.1.jar \
-          WireOracle.java json2dcp.java dcp2fasm.java json_drc.java
-    jar -cfm ../lib/rapidwright_json_drc.jar manifest.mf -C ../lib/classes dev
+`WireOracle` / `BuildWireOracle` / `DumpTileWires` / `list_iob_bels` /
+`FetchDevice` are helpers compiled into the same class tree.
 
-After that, `../run.sh` picks up the new jar.  Edit any of the `.java`
-files first to change behaviour.
+## Rebuild
+
+    make jars          # from the bundle root -- one javac, one jar per tool
+
+`make` knows where the jars, the device data and the wire oracle come
+from; there is no separate build script to keep in sync.  (There used to
+be `build.sh` and `package_json_drc.sh`; both assembled things by copying
+out of a `~/rapidwright/` development tree that no longer exists, and
+`package_json_drc.sh` additionally kept its own duplicate copies of
+`README.md` and this file inline.  `make jars` and `make dist` replace
+them.)
 
 ## Repackaging
 
-`package_json_drc.sh` is the script that produced this tarball.  It
-expects the original development layout (`~/rapidwright/build/`,
-`~/.local/share/RapidWright/data/`, the wire-oracle path) and will not
-work unmodified from the unpacked bundle — it is included here as the
-authoritative record of how the archive was assembled.
+    make dist          # -> /tmp/json_drc-portable-<commit-date>.tar.gz
+
+The working tree is the bundle, so this just builds and tars it, minus
+`src/attic/` and the scratch directories.
+
+## src/attic
+
+Not compiled.  One-off probes and fixup programs from finished
+campaigns, plus one parked fork — see `src/attic/README.md`.
 
 ## Upstream sources
 
