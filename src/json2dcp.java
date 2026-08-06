@@ -790,7 +790,15 @@ public class json2dcp {
                     en.addProperty("NEXTPNR_NAME", nn.name);
             }
             nn.rwNet = n;
-            if (nn.driver != null && nn.driver.cell.rwCell != null) {
+            // A net with a driver but NO users has nothing to route to, and
+            // Vivado's own database does not carry a pin for it: golden ethmin's
+            // CARRY4 cells have logical pins [CI,CYINIT,DI,O,S] where ours have
+            // those plus CO[0..3], because yosys leaves every unused carry-out
+            // connected and we faithfully made a source pin for each.  That is
+            // where the NOLOADS nets come from -- 226 on SERV, 534 on ibex, 903
+            // on picosoc, 1264 on ethmin -- so skip the driver connection and
+            // the net stays as inert in the DCP as it is in the design.
+            if (nn.driver != null && nn.driver.cell.rwCell != null && !nn.users.isEmpty()) {
                 if (nn.driver.cell.attrs.containsKey("X_ORIG_PORT_" + nn.driver.name)) {
                     //System.out.println("connect " + n.getName() + " <- " + nn.driver.cell.name + "." + nn.driver.name);
                     connect_log_and_phys(n, nn.driver.cell.rwCell, nn.driver.cell.attrs.get("X_ORIG_PORT_" + nn.driver.name));
