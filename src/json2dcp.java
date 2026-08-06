@@ -216,6 +216,42 @@ public class json2dcp {
     }
 
 
+    /** Map a nextpnr FLAT port name onto the EDIF cell's actual port.
+     *
+     * nextpnr names hard-block bus pins without brackets -- RXDATA13,
+     * RXCHARISK0 -- but the EDIF GTXE2_CHANNEL declares RXDATA[15:0], so
+     * createPortInst("RXDATA13") finds nothing and the whole bus arrives
+     * undriven.  Vivado then refuses to run phys_opt_design at all:
+     *   [DRC NDRV-1] ... Bus Net ...rxdata_rec[15:0] has undriven bits 0:15.
+     *
+     * Not a blind de-suffix: GTREFCLK0, RXOUTCLK and friends are genuine
+     * SCALAR ports that end in a digit, so the cell's own port list decides.
+     * Exact match wins; only if there is no such port do we split the trailing
+     * digits and check for a bus of that base name.
+     */
+    public static String resolve_edif_pin(Cell cell, String name) {
+        try {
+            EDIFCellInst inst = cell.getEDIFCellInst();
+            if (inst == null || name.endsWith("]"))
+                return name;
+            EDIFCell type = inst.getCellType();
+            if (type == null || type.getPort(name) != null)
+                return name;                       // genuine scalar, e.g. GTREFCLK0
+            int i = name.length();
+            while (i > 0 && Character.isDigit(name.charAt(i - 1)))
+                i--;
+            if (i == name.length() || i == 0)
+                return name;                       // no trailing index to split
+            String base = name.substring(0, i);
+            EDIFPort p = type.getPort(base);
+            if (p != null && p.isBus())
+                return base + "[" + Integer.parseInt(name.substring(i)) + "]";
+            return name;
+        } catch (RuntimeException ex) {
+            return name;
+        }
+    }
+
     public static void connect_log_and_phys(Net net, Cell cell, String logical_pin) {
         // Best-effort wrapper: the SVS all-LUT netlist exposes several const/
         // logical-pin edge cases RapidWright can't map.  Skip the unmappable
@@ -631,6 +667,18 @@ public class json2dcp {
                 EDIFNet en = new EDIFNet(escape_name(nn.name), des.getTopEDIFCell());
                 n = new Net(escape_name(nn.name), new EDIFHierNet(topInst, en));
                 des.addNet(n);
+                // escape_name() rewrites '/' to '_' because RapidWright uses '/'
+                // as its hierarchy separator, so a flat net name containing one
+                // would be misread as hierarchical.  That is necessary but
+                // DESTRUCTIVE: eth...pcs_pma_block_i/transceiver_inst/rxdata_rec[13]
+                // arrives in Vivado as ..._transceiver_inst_rxdata_rec[13], and
+                // nothing in the DCP records which underscores used to be
+                // slashes.  Every downstream join back to the nextpnr netlist
+                // (timing calibration, database diffs) then has to canonicalise
+                // by stripping ALL separators, which is lossy and can collide.
+                // Carry the real name so the mapping stays exact.
+                if (!escape_name(nn.name).equals(nn.name))
+                    en.addProperty("NEXTPNR_NAME", nn.name);
             }
             nn.rwNet = n;
             if (nn.driver != null && nn.driver.cell.rwCell != null) {
@@ -647,8 +695,11 @@ public class json2dcp {
                     // logical net with no driver.  Vivado's delay estimator then
                     // derefs that null logical net and segfaults in
                     // HDPYRoutedSiteBuilder::newRoutedSite on report_timing.
-                    // Same fallback the user branch below already uses.
-                    connect_log_and_phys(n, nn.driver.cell.rwCell, nn.driver.name);
+                    // Same fallback the user branch below already uses, but the
+                    // name has to be resolved against the EDIF cell first: the
+                    // GT's bus pins arrive as RXDATA13, not RXDATA[13].
+                    connect_log_and_phys(n, nn.driver.cell.rwCell,
+                            resolve_edif_pin(nn.driver.cell.rwCell, nn.driver.name));
                 }
             }
             for (NextpnrCellPort usr : nn.users) {
