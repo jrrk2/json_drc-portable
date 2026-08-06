@@ -1131,20 +1131,17 @@ public class json2dcp {
                                 EDIFPort ep = ci.getCellType().getPort(base);
                                 // a bus needs an index; a scalar must not have one
                                 portOk = ep != null && (ep.isBus() == (br > 0));
-                                // BUS MEMBERS ARE OFF BY DEFAULT.  Connecting them
-                                // makes Vivado reject the EDIF outright at read time:
-                                //   [EDIF 20-86] Cannot find port 'PCSRSVDIN' on
-                                //   instance ... of cell 'GTXE2_CHANNEL'
-                                // even though the cell DOES declare PCSRSVDIN[15:0]
-                                // and connect_log_and_phys_impl takes the
-                                // createPortInst(bus, index, inst) path for names
-                                // ending in ']'.  So the member reference is being
-                                // emitted in a form Vivado will not read, and that is
-                                // a separate bug from the missing connections.
-                                // Scalars alone already cover most of the PDCN
-                                // complaints (CPLLRESET, DRPCLK, GTRXRESET, RXUSRCLK,
-                                // TXUSRCLK...).  J2D_HARD_SINK_BUS=1 to include buses.
-                                if (br > 0 && System.getenv("J2D_HARD_SINK_BUS") == null)
+                                // Bus members are ON.  They were gated off while
+                                // Vivado rejected the EDIF with
+                                //   [EDIF 20-86] Cannot find port 'PCSRSVDIN' ...
+                                // but that was the GREEDY NAME SPLIT above emitting
+                                // a negative member (PCSRSVDIN20 read as
+                                // PCSRSVDIN[20] on a 16-wide bus), not anything
+                                // wrong with bus members.  With the split fixed
+                                // they connect cleanly: 402 sink pins instead of
+                                // 134, and zero negative members in the EDIF.
+                                // J2D_HARD_SINK_NO_BUS=1 to go back to scalars only.
+                                if (br > 0 && System.getenv("J2D_HARD_SINK_NO_BUS") != null)
                                     portOk = false;
                             }
                             if (portOk) {
