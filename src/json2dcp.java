@@ -710,8 +710,22 @@ public class json2dcp {
                 // CellPinStaticDefaults, which is about pins), hence the list.
                 String oty = nc.attrs.getOrDefault("X_ORIG_TYPE", nc.type);
                 if (oty != null) {
-                    if (oty.equals("MMCME2_ADV") || oty.equals("PLLE2_ADV")) {
+                    if (oty.equals("MMCME2_ADV") || oty.equals("PLLE2_ADV")
+                            || oty.equals("PLLE2_BASE")) {
                         default_param(nc, "SS_MOD_PERIOD", "10000");
+                        // A PLLE2_BASE in the source names only the outputs it
+                        // uses, and nextpnr's JSON carries only what was named.
+                        // Vivado demands the rest explicitly for a bitstream:
+                        //   [DRC ADEF-841..845] no value for CLKOUT1..5_DIVIDE
+                        //   [DRC AVAL-79,82..87] CLKIN2_PERIOD / CLKOUTn_
+                        //       DUTY_CYCLE / PHASE have unexpected values
+                        // 14 errors on the SERV SoC, all from one PLL.
+                        default_param(nc, "CLKIN2_PERIOD", "0.000");
+                        for (int k = 0; k <= 5; k++) {
+                            if (k > 0) default_param(nc, "CLKOUT" + k + "_DIVIDE", "1");
+                            default_param(nc, "CLKOUT" + k + "_DUTY_CYCLE", "0.500");
+                            default_param(nc, "CLKOUT" + k + "_PHASE", "0.000");
+                        }
                     } else if (oty.startsWith("RAMB18")) {
                         for (String p : new String[]{"INIT_A", "INIT_B", "SRVAL_A", "SRVAL_B"})
                             default_param(nc, p, "18'h00000");
@@ -1865,6 +1879,44 @@ public class json2dcp {
                         + " skipped-cross-slice=" + sumsSkippedCross
                         + " skipped-cross-slot=" + sumsCrossSlot
                         + " failed=" + sumsFailed);
+        }
+
+        // ------------------------------------------------------------------
+        // Tie the two connectivity gaps Vivado insists on.
+        //
+        // CLKINSEL: a PLLE2_BASE in source has no such port, but the PLLE2_ADV
+        // it maps to does, and Vivado rejects it unconnected --
+        //   [DRC REQP-159] the PLLE2_ADV input pins CLKINSEL and at least one
+        //   of CLKIN1 or CLKIN2 must have a connection
+        // The BASE flavour always uses CLKIN1, which is CLKINSEL high.
+        //
+        // <net>$const: nextpnr leaves hard-block inputs it never drove as
+        // undriven nets (RAMB address bits above the used width, unused data
+        // inputs) -- [DRC NDRV-1].  They have no driver by construction, so any
+        // value is as good; GND is what Vivado's own opt_design ties them to.
+        // ------------------------------------------------------------------
+        {
+            int tiedSel = 0;
+            for (NextpnrCell nc : ndes.cells.values()) {
+                if (nc.rwCell == null) continue;
+                String oty = nc.attrs.getOrDefault("X_ORIG_TYPE", nc.type);
+                if (oty == null) continue;
+                if (!(oty.startsWith("PLLE2") || oty.startsWith("MMCME2"))) continue;
+                EDIFCellInst inst = nc.rwCell.getEDIFCellInst();
+                if (inst == null || inst.getPortInst("CLKINSEL") != null) continue;
+                try {
+                    des.getVccNet().getLogicalNet().createPortInst("CLKINSEL", inst);
+                    tiedSel++;
+                } catch (RuntimeException ex) { /* no such port on this flavour */ }
+            }
+            // NOTE: tying the <net>$const pins to GND was TRIED here and makes
+            // the checkpoint UNOPENABLE -- connect_log_and_phys creates physical
+            // site pins, not just a logical tie, and those collide with the IOB
+            // and hard-block site routing (Vivado: 18-4866 "sitetype net ...
+            // overwritten", then open_checkpoint fails).  A logical-only tie via
+            // EDIFNet.createPortInst is the shape to try, not this.
+            if (tiedSel > 0)
+                System.out.println("[tie] CLKINSEL=" + tiedSel);
         }
 
         // ------------------------------------------------------------------
