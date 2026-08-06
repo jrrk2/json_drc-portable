@@ -1,0 +1,27 @@
+# Only src/ is preferred-form source (see src/SOURCES.md).  Everything below is
+# an upstream binary, a build output, or scratch -- 650 MB of it, against
+# ~300 KB of actual source.
+
+# Upstream binaries.  SOURCES.md records the release URLs:
+#   rapidwright-*-standalone-lin64.jar  github.com/Xilinx/RapidWright  (2025.2.1)
+#   gson-*.jar                          github.com/google/gson         (2.10.1)
+lib/*.jar
+lib/*.jar.bak*
+lib/*.jar.pre*
+lib/classes/
+
+# RapidWright device data -- fetched by RapidWright from its own release URL.
+data/
+
+# Wire oracle -- regenerate with src/BuildWireOracle.java (recipe in SOURCES.md).
+# 2.5 MB of generated binary; committed nowhere so the jar stays the only
+# thing a fresh clone has to fetch.
+oracle/
+
+# build.sh output: jars and compiled classes.
+src/*.jar
+src/dev/
+
+# Scratch and bitstreams from unrelated campaigns.
+work/
+artifacts/
