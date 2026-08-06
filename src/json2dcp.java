@@ -94,6 +94,153 @@ public class json2dcp {
         public Cell rwCell;
     }
 
+    /**
+     * SHARED LUT INPUT PINS.
+     *
+     * nextpnr's fixupRouting() merges two logical LUT inputs carrying the SAME
+     * net onto one physical pin and records both names in X_ORIG_PORT_&lt;phys&gt;
+     * ("I3 I4").  RapidWright's pinMappingsP2L is 1:1 physical-&gt;logical, so the
+     * second addPinMapping OVERWRITES the first and a logical pin is silently
+     * dropped -- leaving e.g. a LUT6 with a 64-bit INIT but only 5 connected
+     * inputs and one bel pin "Not assigned".  Vivado reports
+     *
+     *   [Designutils 20-756] Invalid physical equation for the B6LUT bel ...
+     *   the bit width of the INIT value does not match the number of used
+     *   input pins '5'
+     *
+     * and then SEGFAULTS in phys_opt_design / report_route_status /
+     * report_timing, dereferencing the null logical net on the unassigned pin
+     * (HDLHNet::getSigType &lt;- HDPYNetProxy &lt;- HDPYRoutedSiteBuilder::newRoutedSite).
+     *
+     * Since the shared pins carry ONE net, the function restricted to Ia==Ib is
+     * a genuine (k-1)-input function: reduce the logical LUT to the pins
+     * physically present rather than invent routing to a second pin.
+     *
+     * This logic existed only in ethsoc/routedjson2dcp.sh's python preprocessor,
+     * so callers that go straight to json2dcp (json_drc --from-json, and the
+     * Makefile's ethmin_open-eval) produced crashing checkpoints.  It belongs
+     * here, where every caller gets it.
+     */
+    /** "64'hf7" (or a raw bit string) -> an MSB-first bit string of exactly
+     *  `want` bits, or null if it cannot be read that way. */
+    static String init_to_bits(String s, int want) {
+        if (s == null) return null;
+        String bits;
+        int q = s.indexOf("'h");
+        if (q >= 0) {
+            try {
+                bits = new java.math.BigInteger(s.substring(q + 2).trim(), 16).toString(2);
+            } catch (NumberFormatException e) { return null; }
+        } else {
+            for (int i = 0; i < s.length(); i++)
+                if (s.charAt(i) != '0' && s.charAt(i) != '1') return null;
+            bits = s;
+        }
+        if (bits.length() > want) return null;          // wider than the LUT: not ours
+        StringBuilder b = new StringBuilder();
+        for (int i = bits.length(); i < want; i++) b.append('0');
+        return b.append(bits).toString();
+    }
+
+    /** MSB-first bit string -> "<width>'h<hex>", the form parseParam emits. */
+    static String bits_to_init(String bits) {
+        return bits.length() + "'h" + new java.math.BigInteger(bits, 2).toString(16);
+    }
+
+    static void reduce_shared_lut_pins(NextpnrDesign ndes) {
+        int nlut = 0;
+        boolean dbg = System.getenv("J2D_SHARED_LUT_DBG") != null;
+        for (NextpnrCell nc : ndes.cells.values()) {
+            // Is this cell shared at all?  Computed first so a rejection can be
+            // reported: a silent skip here is how the defect survived.
+            boolean anyShared = false;
+            for (Map.Entry<String, String> e0 : nc.attrs.entrySet())
+                if (e0.getKey().startsWith("X_ORIG_PORT_")
+                        && e0.getValue().trim().split("\\s+").length > 1) anyShared = true;
+
+            String oty = nc.attrs.get("X_ORIG_TYPE");
+            if (oty == null || !oty.startsWith("LUT") || oty.length() != 4) {
+                if (anyShared && dbg)
+                    System.out.println("[shared-lut] SKIP " + nc.name + ": X_ORIG_TYPE=" + oty);
+                continue;
+            }
+            int k = oty.charAt(3) - '0';
+            if (k < 1 || k > 6) continue;
+            // parseParam() has ALREADY rewritten a binary INIT into Verilog
+            // sized-hex ("64'hf7"), so this runs on that form, not on the raw
+            // bit string the JSON carried.  Comparing against the bit-string
+            // length silently skipped 4 of the 5 shared LUTs here.
+            String initRaw = nc.params.get("INIT");
+            String init = init_to_bits(initRaw, 1 << k);
+            if (init == null) {
+                if (anyShared && dbg)
+                    System.out.println("[shared-lut] SKIP " + nc.name + ": " + oty
+                            + " INIT=" + initRaw + " (cannot read as " + (1 << k) + " bits)");
+                continue;
+            }
+
+            // physical pin -> logical pins on it
+            java.util.TreeMap<String, java.util.List<Integer>> phys = new java.util.TreeMap<>();
+            boolean shared = false;
+            for (Map.Entry<String, String> e : nc.attrs.entrySet()) {
+                if (!e.getKey().startsWith("X_ORIG_PORT_")) continue;
+                java.util.List<Integer> ins = new java.util.ArrayList<>();
+                for (String tok : e.getValue().trim().split("\\s+")) {
+                    if (tok.length() == 2 && tok.charAt(0) == 'I'
+                            && tok.charAt(1) >= '0' && tok.charAt(1) <= '9')
+                        ins.add(tok.charAt(1) - '0');
+                }
+                if (!ins.isEmpty()) {
+                    phys.put(e.getKey().substring("X_ORIG_PORT_".length()), ins);
+                    if (ins.size() > 1) shared = true;
+                }
+            }
+            if (!shared) continue;
+
+            // old logical index -> physical pin; every input 0..k-1 must appear,
+            // otherwise this LUT has a genuinely unused input and is left alone.
+            String[] where = new String[k];
+            boolean ok = true;
+            for (Map.Entry<String, java.util.List<Integer>> e : phys.entrySet())
+                for (int i : e.getValue()) {
+                    if (i < 0 || i >= k) { ok = false; break; }
+                    where[i] = e.getKey();
+                }
+            if (!ok) continue;
+            for (int i = 0; i < k; i++) if (where[i] == null) { ok = false; break; }
+            if (!ok) continue;
+
+            // physical pin -> lowest old index on it; those survive, in order
+            java.util.TreeMap<String, Integer> rep = new java.util.TreeMap<>();
+            for (int i = 0; i < k; i++)
+                if (!rep.containsKey(where[i])) rep.put(where[i], i);
+            java.util.List<Integer> kept = new java.util.ArrayList<>(rep.values());
+            java.util.Collections.sort(kept);
+            java.util.HashMap<Integer, Integer> slot = new java.util.HashMap<>();
+            for (int j = 0; j < kept.size(); j++) slot.put(kept.get(j), j);
+            int nm = kept.size();
+
+            // Rebuild the truth table over the reduced inputs.  INIT is
+            // MSB-first, so bit for minterm idx is init[len-1-idx].
+            StringBuilder out = new StringBuilder();
+            for (int v = 0; v < (1 << nm); v++) {
+                int o = 0;
+                for (int i = 0; i < k; i++)
+                    if (((v >> slot.get(rep.get(where[i]))) & 1) != 0) o |= 1 << i;
+                out.append(init.charAt(init.length() - 1 - o));
+            }
+            // back out in the same sized-hex form parseParam produced
+            nc.params.put("INIT", bits_to_init(out.reverse().toString()));
+            nc.attrs.put("X_ORIG_TYPE", "LUT" + nm);
+            for (String pin : phys.keySet())
+                nc.attrs.put("X_ORIG_PORT_" + pin, "I" + slot.get(rep.get(pin)));
+            nlut++;
+        }
+        if (nlut > 0)
+            System.out.println("[shared-lut] reduced " + nlut
+                    + " LUT(s) whose logical inputs share a physical pin");
+    }
+
     static class NextpnrDesign {
         // json index --> net
         public HashMap<Integer, NextpnrNet> nets;
@@ -437,6 +584,7 @@ public class json2dcp {
 
         NextpnrDesign ndes = new NextpnrDesign();
         ndes.Import(new JsonParser().parse(new FileReader(args[1])).getAsJsonObject());
+        reduce_shared_lut_pins(ndes);
 
         Design des = new Design("top", args[0]);
 
