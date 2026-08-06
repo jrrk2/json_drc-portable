@@ -758,6 +758,17 @@ public class json2dcp {
             } else if (nn.name.equals("$PACKER_GND_NET")) {
                 n = new Net("GLOBAL_LOGIC0", new EDIFHierNet(topInst, edif_gnd));
                 des.addNet(n);
+            } else if (nn.name.endsWith("$const") && nn.driver == null) {
+                // nextpnr leaves hard-block inputs it never drove as their own
+                // undriven nets (RAMB address bits above the used width, unused
+                // data inputs) -- 96 of them on SERV, 90 on ethmin, and Vivado
+                // rejects the design for it: [DRC NDRV-1] Driverless Nets.
+                // They are constants by construction, so make the net BE the
+                // GND net, exactly as $PACKER_GND_NET is handled above.  Tying
+                // the sink PINS to GND instead was tried and left the
+                // checkpoint unopenable: connect_log_and_phys creates physical
+                // site pins that collide with the hard block's site routing.
+                n = des.getGndNet();
             } else if (nn.name.contains("$subnet$")) {
                 n = new Net(escape_name(nn.name), (EDIFHierNet)null);
                 des.addNet(n);
