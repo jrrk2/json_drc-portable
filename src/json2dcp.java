@@ -19,6 +19,7 @@ import java.util.Map;
 
 public class json2dcp {
     static int skipConst = 0;
+    static int padPinConstraints = 0, padIostdConstraints = 0;
 
     // Set in main() once at startup.  Null if the oracle file is missing —
     // the routing-import path then falls back to the legacy node-graph walk.
@@ -299,15 +300,14 @@ public class json2dcp {
         String parseParam(JsonElement val) {
             JsonPrimitive prim = val.getAsJsonPrimitive();
             if (prim.isNumber()) {
-                int p = prim.getAsInt();
-                int size = 1;
-                if (p < 0) {
-                    size = 32;
-                } else {
-                    while (p >= (1L << size))
-                        ++size;
-                }
-                return "32'h" + Integer.toHexString(p);
+                // A JSON NUMBER is an integer-valued property (CLKOUT2_DIVIDE,
+                // SS_MOD_PERIOD, READ_WIDTH_B ...), which is exactly how yosys
+                // distinguishes it from a bit vector.  Emit the plain decimal:
+                // wrapping it as "32'h..." makes Vivado read a sized literal
+                // where it expects an int and reject or drop the value
+                // ("Incorrect value '5'h10' for property 'SS_MOD_PERIOD'.
+                // Expecting type 'int' with possible values of '4000 to 40000'").
+                return prim.getAsBigInteger().toString();
             } else {
                 String s = prim.getAsString();
                 int state = 0;
@@ -782,6 +782,15 @@ public class json2dcp {
                                 + " (cell " + nc.name + " type " + origType + ")");
                         }
                         SiteTypeEnum variant = SiteTypeEnum.valueOf(belParts[1]);
+                        // NOTE: only when the variant DIFFERS from the site's
+                        // own type.  Forcing it unconditionally was tried and
+                        // breaks the IBUFDS path below: that workaround places
+                        // the cell as Unisim.IBUF, and RapidWright rejects IBUF
+                        // on an IOB18M site ("Site type IOB18M not supported for
+                        // cell type IBUF").  The LVDS master therefore stays
+                        // IOB18 by design, which is what Vivado then objects to
+                        // -- the two constraints are in genuine tension and it
+                        // is not resolvable here.
                         if (variant != s.getSiteTypeEnum()
                                 && des.getSiteInstFromSite(s) == null) {
                             // Pre-allocate the SiteInst with the named variant
@@ -1218,8 +1227,30 @@ public class json2dcp {
                 String wire = routing[i];
                 String pip = routing[i+1];
 
-                if (pip.isEmpty() || pip.trim().isEmpty())
+                if (pip.isEmpty() || pip.trim().isEmpty()) {
+                    // A bare wire entry (no pip) means the net OCCUPIES that
+                    // wire.  When it is a SITEWIRE, the net sits on a SITE PIN,
+                    // and without a SitePinInst the rebuilt net stops short of
+                    // the BEL.  The carry cascade shows it plainly: its whole
+                    // physical evidence is COUT (out) + one tile pip + CIN (in),
+                    // so dropping the CIN entry left dcp2fasm with no carry-in
+                    // and it wrote PRECYINIT.C0 where Vivado has PRECYINIT.CIN
+                    // -- 138 of them, exactly the number of cascading CARRY4s.
+                    if (wire.startsWith("SITEWIRE/")) {
+                        String[] wp = wire.split("/", 3);
+                        if (wp.length == 3) {
+                            SiteInst wsi = des.getSiteInstFromSiteName(wp[1]);
+                            if (wsi != null && wsi.getSitePinInst(wp[2]) == null) {
+                                try {
+                                    n.createPin(wp[2], wsi);
+                                } catch (RuntimeException ex) {
+                                    // pin name not legal on this SiteInst type
+                                }
+                            }
+                        }
+                    }
                     continue;
+                }
                 if (pip.startsWith("SITEPIP")) { pipDroppedSitePip++; continue; }
                 if (pip.contains("SITEWIRE")) {
                     // The simplest and highest-value SITEWIRE case is
@@ -1644,7 +1675,17 @@ public class json2dcp {
 
                     for (BELPin bp : b.getPins()) {
                         for (SitePIP sitePIP : bp.getSitePIPs()) {
-                            if (sitePIP.getInputPin().getSiteWireName().equals(sp[3])) {
+                            // Match on the input PIN NAME as well as the site
+                            // wire name.  dcp2xml writes sp.getInputPinName()
+                            // into the XML, while nextpnr's SITEPIP/ spelling
+                            // uses the site WIRE name -- so a SITEPIP that came
+                            // round from our own XML ("SITEPIP/<site>/BFFMUX/O6")
+                            // never matched, and the site pip was silently not
+                            // applied: 7,405 emitted, 758 features recovered.
+                            // Accept either, null-safely (getSiteWireName() is
+                            // null for a BEL pin with no site wire).
+                            if (java.util.Objects.equals(sitePIP.getInputPinName(), sp[3])
+                                || java.util.Objects.equals(sitePIP.getInputPin().getSiteWireName(), sp[3])) {
 
                                 // Don't route through when inverting
 
@@ -1654,12 +1695,12 @@ public class json2dcp {
                                 BELPin startPin = null;
                                 for (BEL other : si.getBELs())
                                     for (BELPin p : other.getPins())
-                                        if(p.isOutput() && p.getSiteWireName().equals(sitePIP.getInputPin().getSiteWireName()))
+                                        if(p.isOutput() && java.util.Objects.equals(p.getSiteWireName(), sitePIP.getInputPin().getSiteWireName()))
                                             startPin = p;
                                 if (startPin != null) {
                                     for (BEL other : si.getBELs())
                                         for (BELPin p : other.getPins())
-                                            if (p.isInput() && p.getSiteWireName().equals(sitePIP.getOutputPin().getSiteWireName()))
+                                            if (p.isInput() && java.util.Objects.equals(p.getSiteWireName(), sitePIP.getOutputPin().getSiteWireName()))
                                                 si.routeIntraSiteNet(n, startPin, p);
                                 }
 
@@ -1867,6 +1908,8 @@ public class json2dcp {
                 // doesn't pull LOC from EDIF — only from XDC.
                 String pin = nc.attrs.get("PACKAGE_PIN");
                 String iostd = nc.attrs.get("IOSTANDARD");
+                if (pin != null) padPinConstraints++;
+                if (iostd != null) padIostdConstraints++;
                 String portName = nc.name;
                 // Brace the port name so a bus-indexed port like "led[3]"
                 // stays literal under Tcl evaluation.
@@ -1923,8 +1966,15 @@ public class json2dcp {
                             continue;
                         }
                         // Drop the duplicates we already emit per-port.
-                        if (stripped.startsWith("set_property PACKAGE_PIN")
-                                || stripped.startsWith("set_property IOSTANDARD")
+                        // Only drop these when we actually emitted our own
+                        // per-port versions.  A netlist whose PAD cells carry no
+                        // PACKAGE_PIN/IOSTANDARD attributes (anything not coming
+                        // from nextpnr) emits none, and skipping them here as
+                        // "duplicates" then loses them outright: the checkpoint
+                        // opens with every port on IOSTANDARD DEFAULT and Vivado
+                        // raises NSTD-1, which blocks write_bitstream.
+                        if ((stripped.startsWith("set_property PACKAGE_PIN") && padPinConstraints > 0)
+                                || (stripped.startsWith("set_property IOSTANDARD") && padIostdConstraints > 0)
                                 || (stripped.startsWith("set_property SEVERITY")
                                     && stripped.contains("UCIO-1"))) {
                             skipped++;
@@ -2614,6 +2664,27 @@ public class json2dcp {
                 + " pins=" + dn.getPins().size()
                 + " src=" + (dn.getSource() == null ? "NULL" : dn.getSource().toString())
                 + " logical=" + (dn.getLogicalNet() == null ? "NULL" : "ok"));
+        }
+        // RapidWright's own intra-site helpers, opt-in for measurement.
+        //   J2D_CREATE_MISSING_PINS=1  DesignTools.createMissingSitePinInsts
+        //   J2D_ROUTE_SITE=1           SiteInst.routeSite() on every site
+        // The explicit path above restores Vivado's siteroutes verbatim, which
+        // dcp2xml notes is deliberate ("no routeSite approximation"), so these
+        // stay off by default -- but the residual unrouted pins and antennas are
+        // exactly what they are meant to fix, so make them measurable.
+        if (System.getenv("J2D_CREATE_MISSING_PINS") != null) {
+            int before = 0;
+            for (Net n : des.getNets()) before += n.getPins().size();
+            DesignTools.createMissingSitePinInsts(des);
+            int after = 0;
+            for (Net n : des.getNets()) after += n.getPins().size();
+            System.out.println("DRC-INFO createMissingSitePinInsts: site pins "
+                + before + " -> " + after);
+        }
+        if (System.getenv("J2D_ROUTE_SITE") != null) {
+            int n = 0;
+            for (SiteInst si : des.getSiteInsts()) { si.routeSite(); n++; }
+            System.out.println("DRC-INFO routeSite() applied to " + n + " site(s)");
         }
         des.writeCheckpoint(args[2]);
     }

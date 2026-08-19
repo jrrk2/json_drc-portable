@@ -449,8 +449,27 @@ public class dcp2fasm {
                                    : pin;
                     addLine(byTile, tn, prefix + "PRECYINIT." + featPin);
                 } else {
-                    addLine(byTile, tn,
-                        prefix + (cellPinDrivenByLogic(carry4, "CI") ? "PRECYINIT.CIN" : "PRECYINIT.C0"));
+                    // No PRECYINIT SitePIP means the mux passes the dedicated
+                    // carry-in, so the question is only whether a carry-in is
+                    // actually there.  The logical netlist answers it when the
+                    // EDIF carries the CI connection -- but a DCP rebuilt from a
+                    // netlist whose ports are named LOGICALLY (CI) rather than
+                    // in nextpnr's packed form (CIN) has no logical portref for
+                    // it, and every cascading CARRY4 then reported C0 instead of
+                    // CIN (138 of them).  The PHYSICAL evidence is unambiguous
+                    // and present either way: a CIN site pin carrying a real
+                    // (non-constant) net.  Take either.
+                    boolean cin = cellPinDrivenByLogic(carry4, "CI");
+                    if (!cin) {
+                        com.xilinx.rapidwright.design.SitePinInst cinPin = si.getSitePinInst("CIN");
+                        if (cinPin != null && cinPin.getNet() != null) {
+                            String cn = cinPin.getNet().getName();
+                            cin = cn != null && !cn.equals("GND") && !cn.equals("VCC")
+                                  && !cn.equals("<const0>") && !cn.equals("<const1>")
+                                  && !cn.equals("$PACKER_GND_NET") && !cn.equals("$PACKER_VCC_NET");
+                        }
+                    }
+                    addLine(byTile, tn, prefix + (cin ? "PRECYINIT.CIN" : "PRECYINIT.C0"));
                 }
             } else {
                 addLine(byTile, tn, prefix + "PRECYINIT.C0");
@@ -489,6 +508,18 @@ public class dcp2fasm {
     // For *5FF: feeds from IN_A (the LUT5 output), IN_B, etc.
     // Prototype: walk the SiteInst's sitePIPs and find one whose output
     // BEL matches the FFMUX/5FFMUX for this slot.
+    // The carry sum reaching a slice mux is spelled "XOR" by Vivado and
+    // "CARRY4_XOR" by a SitePIP that RapidWright selected when json2dcp built
+    // the checkpoint.  Same physical selection, two names -- and the mismatch is
+    // not cosmetic here: the lookup below compares the used SitePIP's input pin
+    // against the BEL's pin name, so a disagreement returns null and the feature
+    // is DROPPED rather than misspelled (251 of them: AFFMUX/BFFMUX/CFFMUX/
+    // DFFMUX.XOR).  Fold the two spellings together and report Vivado's, which
+    // is what dcp2fasm produces from Vivado's own DCP.
+    static String normFFMuxPin(String pin) {
+        return "CARRY4_XOR".equals(pin) ? "XOR" : pin;
+    }
+
     static String ffMuxLine(SiteInst si, String ffBel, char slot, String suffix) {
         String muxBel = (suffix.equals("5FF") ? (slot + "5FFMUX") : (slot + "FFMUX"));
         com.xilinx.rapidwright.device.SitePIP pip = null;
@@ -498,7 +529,8 @@ public class dcp2fasm {
                 if (!in.isInput()) continue;
                 for (com.xilinx.rapidwright.device.SitePIP cand : in.getSitePIPs()) {
                     if (si.getUsedSitePIP(cand.getBELName()) != null
-                        && si.getUsedSitePIP(cand.getBELName()).getInputPinName().equals(in.getName())) {
+                        && normFFMuxPin(si.getUsedSitePIP(cand.getBELName()).getInputPinName())
+                               .equals(normFFMuxPin(in.getName()))) {
                         pip = cand;
                         break;
                     }
@@ -508,7 +540,7 @@ public class dcp2fasm {
             if (pip != null) break;
         }
         if (pip == null) return null;
-        return muxBel + "." + pip.getInputPinName();
+        return muxBel + "." + normFFMuxPin(pip.getInputPinName());
     }
 
     static boolean getBoolParam(Cell c, String name) {
